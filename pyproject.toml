@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argilla-cli"
+version = "0.1.0"
+description = "A production-quality CLI for Argilla"
+authors = [{name = "Argilla CLI", email = "devnull@example.com"}]
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "argilla>=2.8",
+  "typer>=0.12",
+  "python-dotenv>=1.0",
+  "rich>=13",
+  "pydantic>=2",
+  "pydantic-settings>=2",
+  "requests>=2",
+]
+
+[project.urls]
+Homepage = "https://github.com/argilla-io/argilla"
+
+[project.scripts]
+argilla-cli = "argilla_cli.main:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
+pythonpath = ["src"]
+
+[project.optional-dependencies]
+hub = [
+  "huggingface_hub>=0.24",
+  "Jinja2>=3.1",
+  "datasets>=2.19",
+]
+
+export = [
+  "pandas>=2",
+  "pyarrow>=14",
+]
+

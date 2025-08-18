@@ -1,0 +1,75 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors/IDE
+.vscode/
+.idea/
+.github/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Testing/coverage
+.pytest_cache/
+.coverage
+.coverage.*
+.cache/
+nosetests.xml
+coverage.xml
+htmlcov/
+
+# Type checking / linters
+.mypy_cache/
+.pyright/
+.pyre/
+.ruff_cache/
+
+# Logs
+*.log
+
+# Local environment/config
+.env
+.env.*
+.python-version
+
+# Tooling
+pip-wheel-metadata/
+.tox/
+.nox/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
