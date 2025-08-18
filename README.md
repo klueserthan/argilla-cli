@@ -4,6 +4,27 @@ A CLI for Argilla, built with Typer.
 
 ## Install
 
+Install directly from GitHub (recommended for end users):
+
+```bash
+# via pipx (isolated environment)
+pipx install 'argilla-cli @ git+https://github.com/klueserthan/argilla-cli.git'
+
+# with CSV/Parquet export support
+pipx install 'argilla-cli[export] @ git+https://github.com/klueserthan/argilla-cli.git'
+```
+
+Or with pip into your current environment/virtualenv:
+
+```bash
+pip install 'argilla-cli @ git+https://github.com/klueserthan/argilla-cli.git'
+
+# with CSV/Parquet export support
+pip install 'argilla-cli[export] @ git+https://github.com/klueserthan/argilla-cli.git'
+```
+
+From source (development / editable mode):
+
 Use a virtualenv and install in editable mode:
 
 ```bash
