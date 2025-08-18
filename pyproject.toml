@@ -18,6 +18,7 @@ dependencies = [
   "pydantic>=2",
   "pydantic-settings>=2",
   "requests>=2",
+  "jmespath>=1.0",
 ]
 
 [project.urls]

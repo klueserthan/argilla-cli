@@ -107,7 +107,6 @@ pytest -q
 
 ### Optional dependencies
 
-- Mapping with `--map` needs jmespath: `pip install jmespath`
-- CSV/Parquet export needs pandas: `pip install pandas`
-- Parquet writing needs a parquet engine (e.g., pyarrow): `pip install pyarrow`
+- CSV/Parquet export needs pandas: `pip install pandas` or install the extra: `pip install 'argilla-cli[export] @ git+https://github.com/klueserthan/argilla-cli.git'`
+- Parquet writing needs a parquet engine (e.g., pyarrow): `pip install pyarrow` (included in the `export` extra)
 
