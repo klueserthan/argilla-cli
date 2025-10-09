@@ -114,3 +114,38 @@ def create(
         emit_json(payload)
     else:
         print_table([payload])
+
+
+@app.command("attach-workspace")
+def attach_workspace(
+    username: str = typer.Argument(..., help="Existing user's username"),
+    workspace: str = typer.Argument(..., help="Existing workspace name"),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Output JSON"),
+) -> None:
+    """Add a user to an existing workspace.
+
+    Errors if either the user or workspace does not exist.
+    """
+    try:
+        client = get_client(load_settings().settings)
+        user = client.users(username=username)  # type: ignore[call-arg]
+        if user is None:
+            raise NotFoundError(f"user not found: {username}")
+        ws = client.workspaces(workspace)  # type: ignore[index]
+        if ws is None:
+            raise NotFoundError(f"workspace not found: {workspace}")
+
+        user.add_to_workspace(ws)  # type: ignore[arg-type]
+        payload = {
+            "username": getattr(user, "username", username),
+            "workspace": getattr(ws, "name", workspace),
+            "id": getattr(user, "id", None),
+        }
+    except Exception as e:
+        exit_with_error(e, verbose=state.verbose)
+        return
+
+    if state.json_output or json_output:
+        emit_json(payload)
+    else:
+        print_table([payload])
