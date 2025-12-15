@@ -34,6 +34,43 @@ def me(
         print_table(rows)
 
 
+@app.command("list")
+def list_users(
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Output JSON"),
+) -> None:
+    """List all users with their roles and workspace memberships.
+
+    Examples:
+      argilla-cli user list
+      argilla-cli user list --json
+    """
+    try:
+        client = get_client(load_settings().settings)
+        users = client.users.list()
+        rows = []
+        for user in users:
+            workspaces = [
+                getattr(ws, "name", "") for ws in getattr(user, "workspaces", [])
+            ]
+            rows.append(
+                {
+                    "username": getattr(user, "username", ""),
+                    "first_name": getattr(user, "first_name", ""),
+                    "last_name": getattr(user, "last_name", ""),
+                    "role": str(getattr(user, "role", "")),
+                    "workspaces": ", ".join(workspaces) if workspaces else "(none)",
+                }
+            )
+    except Exception as e:
+        exit_with_error(e, verbose=state.verbose)
+        return
+
+    if state.json_output or json_output:
+        emit_json(rows)
+    else:
+        print_table(rows)
+
+
 @app.command("create")
 def create(
     username: str = typer.Argument(..., help="New user's username"),
