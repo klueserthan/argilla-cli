@@ -153,6 +153,68 @@ def create(
         print_table([payload])
 
 
+@app.command("update")
+def update(
+    username: str = typer.Argument(..., help="Username of user to update"),
+    new_username: str | None = typer.Option(None, "--username", help="New username"),
+    first_name: str | None = typer.Option(None, "--first-name", help="New first name"),
+    last_name: str | None = typer.Option(None, "--last-name", help="New last name"),
+    role: str | None = typer.Option(
+        None, "--role", help="New role: owner, admin, or annotator"
+    ),
+    json_output: bool = typer.Option(False, "--json/--no-json", help="Output JSON"),
+) -> None:
+    """Update an existing user's attributes.
+
+    At least one of --username, --first-name, --last-name, or --role must be provided.
+
+    Examples:
+      argilla-cli user update alice --first-name Alice
+      argilla-cli user update bob --role admin --json
+      argilla-cli user update charlie --username charles --last-name Brown
+    """
+    try:
+        client = get_client(load_settings().settings)
+        user = client.users(username=username)  # type: ignore[call-arg]
+        if user is None:
+            raise NotFoundError(f"user not found: {username}")
+
+        # Apply updates if provided
+        if new_username is not None:
+            user.username = new_username  # type: ignore[attr-defined]
+        if first_name is not None:
+            user.first_name = first_name  # type: ignore[attr-defined]
+        if last_name is not None:
+            user.last_name = last_name  # type: ignore[attr-defined]
+        if role is not None:
+            # Normalize role
+            normalized_role = role.strip().lower()
+            if normalized_role == "administrator":
+                normalized_role = "admin"
+            if normalized_role not in {"owner", "admin", "annotator"}:
+                raise ValidationError("role must be one of: owner, admin, or annotator")
+            user.role = normalized_role  # type: ignore[attr-defined]
+
+        # Perform update
+        updated_user = user.update()  # type: ignore[attr-defined]
+
+        payload = {
+            "username": getattr(updated_user, "username", username),
+            "first_name": getattr(updated_user, "first_name", ""),
+            "last_name": getattr(updated_user, "last_name", ""),
+            "role": str(getattr(updated_user, "role", "")),
+            "id": getattr(updated_user, "id", None),
+        }
+    except Exception as e:
+        exit_with_error(e, verbose=state.verbose)
+        return
+
+    if state.json_output or json_output:
+        emit_json(payload)
+    else:
+        print_table([payload])
+
+
 @app.command("attach-workspace")
 def attach_workspace(
     username: str = typer.Argument(..., help="Existing user's username"),
