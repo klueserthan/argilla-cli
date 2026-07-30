@@ -5,7 +5,6 @@ Thumbs.db
 # Editors/IDE
 .vscode/
 .idea/
-.github/
 
 # Python bytecode
 __pycache__/
@@ -62,7 +61,7 @@ htmlcov/
 # Local environment/config
 .env
 .env.*
-.python-version
+!.env.example
 
 # Tooling
 pip-wheel-metadata/

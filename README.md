@@ -1,112 +1,264 @@
 # argilla-cli
 
-A CLI for Argilla, built with Typer.
+A CLI for managing [Argilla](https://github.com/argilla-io/argilla) servers —
+workspaces, datasets, and users — from your terminal. Built with
+[Typer](https://typer.tiangolo.com/).
 
 ## Install
 
-Install directly from GitHub (recommended for end users):
+### As a tool (recommended)
 
 ```bash
-# via pipx (isolated environment)
-pipx install 'argilla-cli @ git+https://github.com/klueserthan/argilla-cli.git'
+# from PyPI, once published
+uv tool install argilla-cli
 
-# with CSV/Parquet export support
-pipx install 'argilla-cli[export] @ git+https://github.com/klueserthan/argilla-cli.git'
+# from GitHub
+uv tool install 'argilla-cli @ git+https://github.com/klueserthan/argilla-cli.git'
+
+# with an optional extra (see "Optional extras" below)
+uv tool install 'argilla-cli[export] @ git+https://github.com/klueserthan/argilla-cli.git'
 ```
 
-Or with pip into your current environment/virtualenv:
+This installs the `argilla-cli` command in an isolated, managed
+environment and puts it on your `PATH`.
+
+### One-off, without installing
 
 ```bash
-pip install 'argilla-cli @ git+https://github.com/klueserthan/argilla-cli.git'
-
-# with CSV/Parquet export support
-pip install 'argilla-cli[export] @ git+https://github.com/klueserthan/argilla-cli.git'
+uvx --from 'argilla-cli @ git+https://github.com/klueserthan/argilla-cli.git' argilla-cli --help
 ```
 
-From source (development / editable mode):
-
-Use a virtualenv and install in editable mode:
+### From source (development)
 
 ```bash
-pip install -e .
+git clone https://github.com/klueserthan/argilla-cli.git
+cd argilla-cli
+uv sync --all-extras
+uv run argilla-cli --help
 ```
 
-This will install the console command `argilla-cli`.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full development workflow.
 
-## Configure
+### Optional extras
 
-The CLI reads environment variables, preferring the process environment and loading a local `.env` only when required fields are missing.
+| Extra | Adds | Needed for |
+|---|---|---|
+| `export` | `pandas`, `pyarrow` | `--fmt parquet` (JSONL and CSV work without it) |
+| `hub` | `huggingface_hub`, `datasets`, `Jinja2` | `dataset to-hub`, `dataset from-hub` |
 
-Required:
-- `ARGILLA_API_URL`
-- `ARGILLA_API_KEY`
+Install extras with `uv tool install 'argilla-cli[export,hub] @ ...'` or,
+from source, `uv sync --all-extras`.
 
-Optional:
-- `HF_TOKEN`
+## Configuration
 
-Example `.env`:
+Configuration is resolved in this order, highest precedence first:
 
-You can copy the provided `.env.example` to `.env`:
+1. **CLI flags** — `--api-url`, `--api-key`
+2. **Environment variables** — `ARGILLA_API_URL`, `ARGILLA_API_KEY`, `HF_TOKEN`
+3. **Profile** in `config.toml` — see below
+4. **`.env` file** in the current directory
 
-```
+A plain environment-variable setup keeps working untouched; profiles are
+there for when you need more than one.
+
+### Quick start with environment variables
+
+```bash
 cp .env.example .env
-```
-
-Then edit `.env` and set your values:
-
-```
-ARGILLA_API_URL=https://argilla.example.com
-ARGILLA_API_KEY=rbga_your_api_key
-HF_TOKEN=hf_your_hf_token
-```
-
-## Usage
-
-Show config:
-
-```bash
-argilla-cli config show
-```
-
-Doctor:
-
-```bash
+# edit .env and set ARGILLA_API_URL / ARGILLA_API_KEY / (optional) HF_TOKEN
 argilla-cli config doctor
 ```
 
-Workspaces:
+### Profiles (multiple servers)
+
+Profiles let one install talk to several Argilla servers without juggling
+environment variables. They live in
+`$XDG_CONFIG_HOME/argilla-cli/config.toml` (defaulting to
+`~/.config/argilla-cli/config.toml`):
+
+```bash
+# write into the "staging" profile
+argilla-cli config set api_url https://staging.argilla.example.com --profile staging
+argilla-cli config set api_key rbga_staging_key --profile staging
+
+# write into the "prod" profile and make it the default
+argilla-cli config set api_url https://argilla.example.com --profile prod
+argilla-cli config set api_key rbga_prod_key --profile prod
+argilla-cli config use prod
+
+# inspect
+argilla-cli config list
+argilla-cli config show
+
+# use a non-default profile for one invocation
+argilla-cli -p staging dataset list
+```
+
+Other config commands: `config get <key>`, `config remove <profile>`.
+
+## Usage
+
+### Global flags
+
+These are declared once on the root command and apply to **every**
+subcommand. They must come **before** the subcommand:
+
+```bash
+argilla-cli [GLOBAL FLAGS] <group> <command> [ARGS]...
+```
+
+| Flag | Short | Description |
+|---|---|---|
+| `--output {table,json,yaml,csv}` | `-o` | Output format for structured results. Default `table`. |
+| `--workspace NAME` | `-w` | Default workspace for this invocation. |
+| `--profile NAME` | `-p` | Configuration profile to use. |
+| `--api-url URL` | | Override the Argilla API URL. |
+| `--api-key KEY` | | Override the Argilla API key. |
+| `--yes` | `-y` | Assume yes; never prompt for confirmation. |
+| `--verbose` | `-v` | Include underlying error detail. |
+| `--quiet` | `-q` | Suppress non-essential output. |
+| `--version` | `-V` | Show the version and exit. |
+
+There is **no** per-command `--json` flag — that was removed. Use the
+global `-o/--output` flag instead:
+
+```bash
+argilla-cli -o json dataset list
+argilla-cli -o yaml workspace show my-ws
+argilla-cli -o csv user list > users.csv
+```
+
+### `config` — inspect and manage configuration
+
+```bash
+argilla-cli config show               # effective config, secrets masked, sources shown
+argilla-cli config doctor             # check credentials + server connectivity
+argilla-cli config list               # list configured profiles
+argilla-cli config set api_url <url>  # write a value into a profile
+argilla-cli config get api_url        # read a value from a profile
+argilla-cli config use staging        # select the default profile
+argilla-cli config remove staging     # delete a profile
+```
+
+### `workspace` — manage workspaces
 
 ```bash
 argilla-cli workspace list
+argilla-cli workspace show my-ws
 argilla-cli workspace create my-ws --exists-ok
+argilla-cli workspace delete my-ws
+argilla-cli workspace users my-ws
+argilla-cli workspace add-user my-ws jane
+argilla-cli workspace remove-user my-ws jane
 ```
 
-Datasets:
+### `dataset` — manage datasets
 
 ```bash
-argilla-cli dataset download my-ds --output ./my.jsonl
-# with mapping (JMESPath JSON file)
-argilla-cli dataset download my-ds --map mapping.json --fmt jsonl --output ./mapped.jsonl
- 
-# CSV/Parquet exports require pandas; Parquet also needs a parquet engine like pyarrow
-argilla-cli dataset download my-ds --fmt csv --output ./my.csv
-argilla-cli dataset download my-ds --fmt parquet --output ./my.parquet
- 
-# Only include completed records
-argilla-cli dataset download my-ds --completed-only --output ./completed.jsonl
+argilla-cli dataset list                      # every workspace
+argilla-cli dataset list -w my-ws             # one workspace
+argilla-cli dataset show my-ds -w my-ws       # fields, questions, record counts
+argilla-cli dataset delete my-ds -w my-ws
 ```
+
+If a dataset name exists in more than one workspace, pass `-w` — otherwise the
+command stops and tells you which workspaces it found.
+
+#### Export
+
+```bash
+argilla-cli dataset download my-ds -w my-ws -O ./my.jsonl
+argilla-cli dataset download my-ds --fmt csv                  # no extra required
+argilla-cli dataset download my-ds --fmt parquet              # needs the `export` extra
+argilla-cli dataset download my-ds --completed-only --limit 500
+argilla-cli dataset download my-ds --flatten                  # fields.text instead of nested
+argilla-cli dataset download my-ds -O ./out.jsonl --force     # overwrite
+```
+
+`-O/--output-path` accepts a file or a directory; a bare stem gains the format
+suffix automatically. `--completed-only` and `--limit` behave identically for
+every format.
+
+Reshape records on the way out with a JMESPath mapping file
+(`{"text": "fields.text", "state": "status"}`):
+
+```bash
+argilla-cli dataset download my-ds --map mapping.json
+argilla-cli dataset download my-ds --map mapping.json --list-policy first
+argilla-cli dataset download my-ds --map mapping.json --list-policy join --list-sep '|'
+```
+
+`--list-policy` decides what happens when an expression returns a list:
+`join` (default), `first`, or `error`.
+
+#### Import, copy, and reuse
+
+```bash
+# upload records from a local file (the inverse of download; --map works here too)
+argilla-cli dataset push my-ds -w my-ws --from ./my.jsonl
+argilla-cli dataset push my-ds --from ./my.csv --fmt csv
+
+# duplicate a dataset, optionally into another workspace
+argilla-cli dataset copy my-ds my-ds-copy -w my-ws --to-workspace other-ws
+argilla-cli dataset copy my-ds my-ds-copy -w my-ws --no-records   # settings only
+
+# export settings, then stamp out a new dataset from them
+argilla-cli dataset settings my-ds -w my-ws --export ./settings.json
+argilla-cli dataset create new-ds -w my-ws --settings ./settings.json
+```
+
+#### Progress and Hub interop
+
+```bash
+argilla-cli dataset progress my-ds -w my-ws
+argilla-cli dataset progress my-ds -w my-ws --by-user
+
+# Hugging Face Hub (needs the `hub` extra)
+argilla-cli dataset to-hub my-ds org/my-ds -w my-ws --private
+argilla-cli dataset from-hub org/my-ds --name my-ds -w my-ws
+```
+
+### `user` — manage users
+
+```bash
+argilla-cli user me
+argilla-cli user list
+argilla-cli user show jane
+argilla-cli user create jane --role annotator
+argilla-cli user delete jane
+argilla-cli user add-to-workspace jane my-ws
+argilla-cli user remove-from-workspace jane my-ws
+```
+
+### `server` — inspect the server
+
+```bash
+argilla-cli server info
+argilla-cli server whoami
+argilla-cli server health
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | unexpected/unclassified error |
+| 2 | usage error (bad flags, unsupported values) |
+| 10 | authentication or configuration problem |
+| 11 | network or server-side failure |
+| 12 | resource not found |
+| 13 | validation error (bad input, conflicting state, missing extra) |
+
+Pass `-v/--verbose` to include the underlying exception detail alongside
+the mapped error message.
 
 ## Development
 
-- Python 3.11+
-- Run tests with pytest
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full uv-based dev loop.
+Short version:
 
 ```bash
-pytest -q
+uv sync --all-extras
+make check   # ruff check + ruff format --check + mypy + pytest, same as CI
 ```
-
-### Optional dependencies
-
-- CSV/Parquet export needs pandas: `pip install pandas` or install the extra: `pip install 'argilla-cli[export] @ git+https://github.com/klueserthan/argilla-cli.git'`
-- Parquet writing needs a parquet engine (e.g., pyarrow): `pip install pyarrow` (included in the `export` extra)
-
