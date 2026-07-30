@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -798,3 +799,202 @@ def test_malformed_settings_file_is_a_validation_error(
 
     assert result.exit_code == 13, result.output
     assert "Traceback" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Sixth review round
+# ---------------------------------------------------------------------------
+
+
+def test_native_parquet_list_columns_are_readable(tmp_path: Path) -> None:
+    """A Parquet file with a native list column can be read back.
+
+    pandas+pyarrow hands such a cell back as a NumPy array, and the
+    missing-value check compared it with `==`, whose array result raises
+    "truth value of an array is ambiguous" -- so valid records never
+    reached records.log().
+    """
+    import pandas as pd
+
+    target = tmp_path / "native.parquet"
+    pd.DataFrame(
+        [{"id": "r1", "labels": ["a", "b"]}, {"id": "r2", "labels": ["c"]}]
+    ).to_parquet(target, index=False)
+
+    restored = read_records(target, RecordFormat.PARQUET)
+
+    assert len(restored) == 2
+    assert list(restored[0]["labels"]) == ["a", "b"]
+
+
+def test_push_of_native_parquet_reaches_the_server(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla
+) -> None:
+    """End to end: such a file pushes instead of erroring out."""
+    import pandas as pd
+
+    pd.DataFrame([{"id": "r1", "labels": ["a", "b"]}]).to_parquet(
+        "native.parquet", index=False
+    )
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "native.parquet"]
+    )
+
+    assert result.exit_code == 0, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    assert len(intents.records.logged) == 1
+
+
+class _StreamingRecords:
+    """Records that page lazily, and count how many were actually fetched."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.fetched = 0
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        def generate() -> Iterator[dict[str, Any]]:
+            for row in self.rows:
+                self.fetched += 1
+                yield row
+
+        return generate()
+
+    def to_list(self, flatten: bool = False) -> list[dict[str, Any]]:
+        self.fetched = len(self.rows)
+        return list(self.rows)
+
+
+def test_limit_stops_fetching_early(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--limit N` must stop pulling records, not slice after fetching all.
+
+    to_list() materialises the whole dataset first, so a limit of 10 against
+    a million records still transferred a million.
+    """
+    workspace = FakeWorkspace("nlp-lab")
+    dataset = FakeDataset("big", "nlp-lab", [])
+    streaming = _StreamingRecords(
+        [{"id": f"r{i}", "status": "completed"} for i in range(1000)]
+    )
+    dataset.records = streaming  # type: ignore[assignment]
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[dataset]))
+
+    result = runner.invoke(
+        app, ["dataset", "download", "big", "-w", "nlp-lab", "--limit", "5"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(Path("big.jsonl").read_text(encoding="utf-8").strip().splitlines()) == 5
+    # The whole point: only a handful of records were ever pulled.
+    assert streaming.fetched < 50, (
+        f"fetched {streaming.fetched} records for a limit of 5"
+    )
+
+
+def test_limit_with_filter_still_fills_the_quota(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Streaming keeps pulling until N *matching* records are found."""
+    workspace = FakeWorkspace("nlp-lab")
+    dataset = FakeDataset("mixed", "nlp-lab", [])
+    rows: list[dict[str, Any]] = [
+        {"id": f"p{i}", "status": "pending"} for i in range(20)
+    ]
+    rows += [{"id": f"c{i}", "status": "completed"} for i in range(5)]
+    dataset.records = _StreamingRecords(rows)  # type: ignore[assignment]
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[dataset]))
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "download",
+            "mixed",
+            "-w",
+            "nlp-lab",
+            "--completed-only",
+            "--limit",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = Path("mixed.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 3
+    assert json.loads(lines[0])["id"] == "c0"
+
+
+def test_copy_rolls_back_when_logging_records_fails(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed record copy must not leave the destination behind.
+
+    Otherwise the command errors out but the half-made dataset lingers, and
+    retrying with the same name collides with it.
+    """
+    import argilla
+
+    workspace = FakeWorkspace("nlp-lab")
+    source = FakeDataset("src", "nlp-lab", [{"id": "r1", "fields": {"text": "a"}}])
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[source]))
+
+    created: list[FakeDataset] = []
+
+    def factory(**kwargs: Any) -> Any:
+        dataset = FakeDataset(kwargs.get("name", "copy"), "nlp-lab", [])
+
+        def boom(records: Any) -> None:
+            raise _ApiError("bulk upsert rejected", 422)
+
+        dataset.records.log = boom  # type: ignore[assignment]
+
+        class _Wrapper:
+            def create(self) -> FakeDataset:
+                created.append(dataset)
+                return dataset
+
+        return _Wrapper()
+
+    monkeypatch.setattr(argilla, "Dataset", factory)
+
+    result = runner.invoke(app, ["dataset", "copy", "src", "src-copy", "-w", "nlp-lab"])
+
+    assert result.exit_code == 13, result.output
+    assert len(created) == 1
+    assert created[0].deleted is True, "destination should have been rolled back"
+
+
+def test_copy_does_not_create_when_the_source_read_fails(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reading the source happens first, so a fetch failure creates nothing."""
+    import argilla
+
+    workspace = FakeWorkspace("nlp-lab")
+    source = FakeDataset("src", "nlp-lab", [])
+
+    def failing_to_list(flatten: bool = False) -> Any:
+        raise _ApiError("source unreadable", 503)
+
+    monkeypatch.setattr(source.records, "to_list", failing_to_list)
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[source]))
+
+    created: list[Any] = []
+
+    def factory(**kwargs: Any) -> Any:
+        class _Wrapper:
+            def create(self) -> FakeDataset:
+                created.append(kwargs)
+                return FakeDataset("src-copy", "nlp-lab", [])
+
+        return _Wrapper()
+
+    monkeypatch.setattr(argilla, "Dataset", factory)
+
+    result = runner.invoke(app, ["dataset", "copy", "src", "src-copy", "-w", "nlp-lab"])
+
+    assert result.exit_code == 11, result.output
+    assert created == [], "nothing should have been created"

@@ -16,7 +16,7 @@ from argilla_cli.errors import (
     handle_errors,
     is_classified,
 )
-from argilla_cli.io_utils import print_ok, render
+from argilla_cli.io_utils import print_ok, print_warn, render
 from argilla_cli.options import LimitOpt, WorkspaceOpt, confirm, resolve_workspace_name
 from argilla_cli.records_io import (
     ListPolicy,
@@ -409,6 +409,14 @@ def copy(
         raise ValidationError("could not determine the destination workspace")
     resolve_workspace(client, destination)
 
+    # Read the source before creating anything, so a fetch failure leaves no
+    # half-made dataset behind to collide with the next attempt.
+    records = (
+        [strip_server_ids(row) for row in iter_dataset_records(source)]
+        if with_records
+        else []
+    )
+
     new_dataset = rg.Dataset(
         name=target_name,
         workspace=destination,
@@ -416,12 +424,21 @@ def copy(
         client=client,
     ).create()
 
-    count = 0
-    if with_records:
-        records = [strip_server_ids(row) for row in iter_dataset_records(source)]
-        if records:
+    if records:
+        try:
             new_dataset.records.log(records)
-        count = len(records)
+        except Exception:
+            # The dataset exists but is empty or partial. Remove it rather
+            # than leave an artifact that makes retrying the same name fail.
+            try:
+                new_dataset.delete()
+            except Exception:  # noqa: BLE001 - rollback is best-effort
+                print_warn(
+                    f"Could not remove the partially copied dataset "
+                    f"'{target_name}'; delete it before retrying."
+                )
+            raise
+    count = len(records)
 
     print_ok(f"Copied '{name}' to '{target_name}' in workspace '{destination}'")
     render(

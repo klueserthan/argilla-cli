@@ -157,10 +157,27 @@ def transform_record(
 def iter_dataset_records(
     dataset: Any, *, flatten: bool = False, limit: int | None = None
 ) -> Iterator[dict[str, Any]]:
-    """Yield a dataset's records as plain dicts."""
+    """Yield a dataset's records as plain dicts.
+
+    Prefers the SDK's lazy record iterator, which pages through the dataset
+    and only fetches the next batch on demand. That matters because callers
+    stop early: ``--limit 10`` against a million-record dataset used to pull
+    the whole thing into memory first, since ``to_list()`` materialises
+    everything before any downstream slicing runs. Laziness composes with the
+    filter-then-limit pipeline in ``_build_rows``, so ``--completed-only
+    --limit N`` keeps pulling until it has N *matching* records, and no
+    further.
+
+    ``to_list`` remains the path when ``flatten`` is requested, since only it
+    can produce the dotted-key form.
+    """
     records = getattr(dataset, "records", None)
     if records is None:
         raise ValidationError("dataset does not expose records")
+
+    if not flatten and callable(records):
+        yield from _stream_records(records)
+        return
 
     to_list = getattr(records, "to_list", None)
     if not callable(to_list):
@@ -185,10 +202,35 @@ def iter_dataset_records(
         yield _as_dict(row, index)
 
 
+def _stream_records(records: Any) -> Iterator[dict[str, Any]]:
+    """Page through the dataset's records, fetching only what is consumed."""
+    try:
+        iterator = iter(records())
+    except Exception as exc:
+        if is_classified(exc):
+            raise
+        raise ValidationError(f"failed to read records: {exc}") from exc
+
+    index = 0
+    while True:
+        try:
+            record = next(iterator)
+        except StopIteration:
+            return
+        except Exception as exc:
+            # Each batch is a separate request, so a failure part-way through
+            # is still a network event and must keep its own exit code.
+            if is_classified(exc):
+                raise
+            raise ValidationError(f"failed to read records: {exc}") from exc
+        yield _as_dict(record, index)
+        index += 1
+
+
 def _as_dict(record: Any, index: int) -> dict[str, Any]:
     if isinstance(record, dict):
         return record
-    for attr in ("model_dump", "dict"):
+    for attr in ("to_dict", "model_dump", "dict"):
         method = getattr(record, attr, None)
         if callable(method):
             try:
@@ -258,9 +300,14 @@ def _is_missing(value: Any) -> bool:
     rejected. Neither format can distinguish "absent" from "empty", so the
     round-trip treats them alike; JSONL preserves the difference.
     """
-    if value is None or value == "":
+    # Tested scalar-first and without ever comparing the value itself with
+    # ``==``. A Parquet file with a native list column yields NumPy arrays,
+    # and ``array == ""`` returns an array whose truth value raises.
+    if value is None:
         return True
-    return isinstance(value, float) and value != value  # NaN
+    if isinstance(value, float):
+        return value != value  # NaN
+    return isinstance(value, str) and value == ""
 
 
 def _unscalarize(value: Any) -> Any:
