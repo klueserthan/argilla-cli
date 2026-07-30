@@ -222,6 +222,21 @@ def _scalarize(value: Any) -> Any:
     return value
 
 
+def _is_missing(value: Any) -> bool:
+    """True for a tabular cell that stands in for an absent key.
+
+    ``csv.DictWriter`` fills a column a given row lacks with ``""``, and
+    pandas fills it with ``NaN``. Restoring those as real values would send
+    ``metadata: ""`` to Argilla for records that simply had no metadata,
+    which is not a mapping and can get the whole ``records.log()`` batch
+    rejected. Neither format can distinguish "absent" from "empty", so the
+    round-trip treats them alike; JSONL preserves the difference.
+    """
+    if value is None or value == "":
+        return True
+    return isinstance(value, float) and value != value  # NaN
+
+
 def _unscalarize(value: Any) -> Any:
     """Inverse of :func:`_scalarize`, for reading tabular formats back.
 
@@ -319,13 +334,11 @@ def read_records(path: Path, fmt: RecordFormat) -> list[dict[str, Any]]:
         return rows
 
     # CSV and Parquet cells are flat, so undo the JSON encoding that
-    # write_records applied to nested values.
+    # write_records applied to nested values, and drop the filler cells
+    # that stand in for keys a given row never had.
     if fmt is RecordFormat.CSV:
         with path.open(encoding="utf-8", newline="") as handle:
-            return [
-                {k: _unscalarize(v) for k, v in row.items()}
-                for row in csv.DictReader(handle)
-            ]
+            return [_restore_row(row) for row in csv.DictReader(handle)]
 
     pd = _require_pandas()
     try:
@@ -336,10 +349,12 @@ def read_records(path: Path, fmt: RecordFormat) -> list[dict[str, Any]]:
         raise MissingExtraError(
             "Parquet support", "export", "argilla-cli[export]"
         ) from exc
-    return [
-        {k: _unscalarize(v) for k, v in record.items()}
-        for record in frame.to_dict(orient="records")
-    ]
+    return [_restore_row(record) for record in frame.to_dict(orient="records")]
+
+
+def _restore_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild one record from a tabular row."""
+    return {k: _unscalarize(v) for k, v in row.items() if not _is_missing(v)}
 
 
 def resolve_target_path(

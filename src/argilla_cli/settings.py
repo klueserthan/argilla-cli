@@ -20,11 +20,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import dotenv_values, find_dotenv
-from pydantic import BaseModel, field_validator
+from pydantic import AnyHttpUrl, BaseModel, TypeAdapter, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from argilla_cli.errors import AuthConfigError, ValidationError
 from argilla_cli.profiles import PROFILE_KEYS, load_store
+
+#: Reuses pydantic's URL grammar without forcing the field to be required.
+_HTTP_URL = TypeAdapter(AnyHttpUrl)
 
 REQUIRED_ENV_VARS = ("ARGILLA_API_URL", "ARGILLA_API_KEY")
 OPTIONAL_ENV_VARS = ("HF_TOKEN",)
@@ -64,11 +67,26 @@ class Settings(BaseModel):
     @field_validator("api_url")
     @classmethod
     def _check_url(cls, value: str | None) -> str | None:
+        """Validate against ``AnyHttpUrl`` but keep the caller's spelling.
+
+        Making this field optional meant dropping the ``AnyHttpUrl``
+        annotation, and a hand-rolled scheme-prefix check let genuinely
+        malformed URLs (an empty host, an out-of-range port) through to
+        client construction, where they failed as an unclassified exit 1 and
+        made ``config show`` report broken config as fine. Validation is
+        delegated back to pydantic; the original string is returned so the
+        URL is not silently rewritten with a trailing slash.
+        """
         if value is None:
             return None
         value = value.strip().rstrip("/")
         if not value.startswith(("http://", "https://")):
             raise ValueError("must start with http:// or https://")
+        try:
+            _HTTP_URL.validate_python(value)
+        except PydanticValidationError as exc:
+            detail = exc.errors()[0]["msg"] if exc.errors() else "invalid URL"
+            raise ValueError(detail.removeprefix("Value error, ")) from exc
         return value
 
     @property

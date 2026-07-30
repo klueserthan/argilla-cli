@@ -484,8 +484,24 @@ def from_hub(
         kwargs["split"] = split
     if subset:
         kwargs["subset"] = subset
+    # The SDK forwards this to snapshot_download and load_dataset, so a token
+    # held in a profile rather than the environment still reaches private
+    # repos -- matching what `to-hub` already does.
+    token = ctx.settings.hf_token
+    if token:
+        kwargs["token"] = token
 
     dataset = rg.Dataset.from_hub(repo_id, **kwargs)
+
+    # from_hub is typed Union[Dataset, str]: under settings="ui" it returns a
+    # configuration URL instead of a dataset. We always pass "auto", so this
+    # is defensive -- but rendering a string as a record row would be worse
+    # than saying plainly what came back.
+    if isinstance(dataset, str):
+        print_ok(f"Argilla needs settings configured for '{repo_id}'")
+        render({"repo_id": repo_id, "configure_url": dataset})
+        return
+
     print_ok(f"Imported '{repo_id}' into Argilla")
     render(_row(dataset), columns=_COLUMNS)
 

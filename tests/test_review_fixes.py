@@ -410,3 +410,166 @@ def test_missing_parquet_engine_on_read_is_validation_error(
         read_records(target, RecordFormat.PARQUET)
     assert excinfo.value.exit_code == 13
     assert "argilla-cli[export]" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Third review round
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fmt", [RecordFormat.CSV, RecordFormat.PARQUET])
+def test_absent_keys_are_not_restored_as_empty_cells(
+    fmt: RecordFormat, tmp_path: Path
+) -> None:
+    """A key a record never had must not come back as "" or NaN.
+
+    Tabular writers pad every row to the union of columns, so a record
+    without `metadata` gained an empty cell. Restoring that as a value sent
+    `metadata: ""` to Argilla, which is not a mapping and can get the whole
+    log() batch rejected.
+    """
+    rows = [
+        {"id": "r1", "fields": {"text": "a"}, "metadata": {"k": "v"}},
+        {"id": "r2", "fields": {"text": "b"}},
+    ]
+    target = tmp_path / f"records.{fmt.value}"
+
+    write_records(rows, target, fmt)
+    restored = read_records(target, fmt)
+
+    assert restored[0]["metadata"] == {"k": "v"}
+    assert "metadata" not in restored[1]
+    assert restored[1]["fields"] == {"text": "b"}
+
+
+def test_push_of_heterogeneous_csv_omits_absent_keys(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla, tmp_path: Path
+) -> None:
+    """End to end: pushing a ragged CSV does not invent empty properties."""
+    source = Path("ragged.csv")
+    write_records(
+        [
+            {"id": "r1", "metadata": {"k": "v"}},
+            {"id": "r2"},
+        ],
+        source,
+        RecordFormat.CSV,
+    )
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", str(source)]
+    )
+
+    assert result.exit_code == 0, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    assert "metadata" not in intents.records.logged[1]
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://?x=1", "https://host:99999", "http://", "not-a-url"],
+)
+def test_malformed_api_urls_are_validation_errors(url: str, runner: CliRunner) -> None:
+    """A malformed API URL exits 13, not an unclassified 1 from the SDK.
+
+    Making api_url optional dropped its AnyHttpUrl annotation; the
+    replacement scheme-prefix check let an empty host or an out-of-range
+    port through to client construction.
+    """
+    result = runner.invoke(app, ["--api-url", url, "--api-key", "k", "config", "show"])
+
+    assert result.exit_code == 13, result.output
+    assert "api_url" in result.output
+
+
+def test_valid_api_url_is_untouched(runner: CliRunner) -> None:
+    """A good URL still passes and is not rewritten."""
+    result = runner.invoke(
+        app,
+        [
+            "-o",
+            "json",
+            "--api-url",
+            "https://argilla.example.com",
+            "--api-key",
+            "k",
+            "config",
+            "show",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["api_url"] == "https://argilla.example.com"
+
+
+def test_from_hub_forwards_the_configured_token(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An HF token held in config reaches from-hub, as it already did to-hub."""
+    import argilla
+
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_token_value")
+    captured: dict[str, Any] = {}
+
+    def fake_from_hub(repo_id: str, **kwargs: Any) -> FakeDataset:
+        captured.update(kwargs)
+        return FakeDataset("imported", "nlp-lab")
+
+    monkeypatch.setattr(argilla.Dataset, "from_hub", staticmethod(fake_from_hub))
+
+    result = runner.invoke(
+        app, ["dataset", "from-hub", "org/ds", "--name", "imported", "-w", "nlp-lab"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["token"] == "hf_secret_token_value"
+
+
+def test_from_hub_does_not_double_create(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """from-hub must not call .create() on the dataset the SDK already made.
+
+    Under settings="auto" the SDK persists the dataset itself (from_disk and
+    the Settings branch both call create()). Calling it again here would hit
+    a 409 on a dataset that imported fine.
+    """
+    import argilla
+
+    created: list[str] = []
+
+    class Tracking(FakeDataset):
+        def create(self) -> Tracking:
+            created.append(self.name)
+            return self
+
+    monkeypatch.setattr(
+        argilla.Dataset,
+        "from_hub",
+        staticmethod(lambda repo_id, **kw: Tracking("imported", "nlp-lab")),
+    )
+
+    result = runner.invoke(app, ["dataset", "from-hub", "org/ds", "-w", "nlp-lab"])
+
+    assert result.exit_code == 0, result.output
+    assert created == []
+
+
+def test_from_hub_reports_a_configuration_url_clearly(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A str return (settings="ui") is reported, not rendered as a record."""
+    import argilla
+
+    monkeypatch.setattr(
+        argilla.Dataset,
+        "from_hub",
+        staticmethod(lambda repo_id, **kw: "https://argilla.example.com/configure"),
+    )
+
+    result = runner.invoke(
+        app, ["-o", "json", "dataset", "from-hub", "org/ds", "-w", "nlp-lab"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["configure_url"].startswith("https://")
