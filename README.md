@@ -46,6 +46,14 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full development workflow.
 | `export` | `pandas`, `pyarrow` | `--fmt parquet` (JSONL and CSV work without it) |
 | `hub` | `huggingface_hub`, `datasets`, `Jinja2` | `dataset to-hub`, `dataset from-hub` |
 
+In practice the Argilla SDK already pulls in `datasets`, which brings
+`pandas` and `pyarrow` with it, so both extras are often satisfied by a
+plain install — `Jinja2` is usually the only genuinely missing piece. The
+extras pin those dependencies explicitly rather than relying on that,
+since it is a transitive detail that can change between SDK releases.
+Commands that need a missing package fail with exit 13 and an install hint
+rather than a stack trace.
+
 Install extras with `uv tool install 'argilla-cli[export,hub] @ ...'` or,
 from source, `uv sync --all-extras`.
 
@@ -188,8 +196,14 @@ argilla-cli dataset download my-ds --map mapping.json --list-policy first
 argilla-cli dataset download my-ds --map mapping.json --list-policy join --list-sep '|'
 ```
 
-`--list-policy` decides what happens when an expression returns a list:
-`join` (default), `first`, or `error`.
+`--list-policy` decides what happens when an expression returns a container:
+`join` (the export default), `first`, `error`, or `preserve`.
+
+`preserve` keeps mappings and lists intact instead of flattening them, and
+is the default for `push` — Argilla's structured properties (`fields`,
+`metadata`, `suggestions`, `vectors`) have to arrive as containers, not
+strings. Export defaults to `join` because a tabular cell cannot hold one.
+Either command accepts either policy.
 
 #### Import, copy, and reuse
 
