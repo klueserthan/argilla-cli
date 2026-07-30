@@ -319,7 +319,5 @@ def patch_client(
     """Route ``ctx.client()`` to the fake server for every test."""
     from argilla_cli.clients import argilla_client
 
-    monkeypatch.setattr(
-        argilla_client, "get_client", lambda settings: fake_client
-    )
+    monkeypatch.setattr(argilla_client, "get_client", lambda settings: fake_client)
     return fake_client
