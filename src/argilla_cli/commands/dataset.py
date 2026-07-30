@@ -335,14 +335,17 @@ def push(
         ),
     ] = None,
     map_file: MapOpt = None,
-    list_policy: ListPolicyOpt = ListPolicy.JOIN,
+    list_policy: ListPolicyOpt = ListPolicy.PRESERVE,
     list_sep: ListSepOpt = ", ",
     limit: LimitOpt = None,
 ) -> None:
     """Upload records from a local file into an existing dataset.
 
     The inverse of `download`: the same `--map` JMESPath machinery reshapes
-    incoming rows before they are logged.
+    incoming rows before they are logged. Unlike export, `--list-policy`
+    defaults to `preserve` here, because Argilla's structured properties
+    (`fields`, `metadata`, `suggestions`, `vectors`) must reach the server as
+    mappings and lists rather than flattened strings.
     """
     dataset = resolve_dataset(ctx.client(), name, resolve_workspace_name(workspace))
 
@@ -488,10 +491,19 @@ def from_hub(
 
 
 def _require_hub() -> None:
-    """Fail clearly when the optional Hub dependencies are absent."""
+    """Fail clearly when the optional Hub dependencies are absent.
+
+    ``jinja2`` is the load-bearing check. The argilla SDK already depends on
+    ``datasets`` and ``huggingface_hub``, so testing only those two always
+    succeeds even without the extra installed, and the missing template
+    dependency then surfaced as a raw ImportError from deep inside the SDK's
+    dataset-card rendering. The other two are kept as a cheap guard in case
+    that dependency ever changes.
+    """
     try:
         import datasets  # noqa: F401
         import huggingface_hub  # noqa: F401
+        import jinja2  # noqa: F401
     except ImportError as exc:
         raise MissingExtraError(
             "Hugging Face Hub support", "hub", "argilla-cli[hub]"

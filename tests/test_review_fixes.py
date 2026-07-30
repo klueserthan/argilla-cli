@@ -262,3 +262,151 @@ def test_limit_applies_after_completed_filter(
     lines = Path("mixed.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["id"] == "c1"
+
+
+# ---------------------------------------------------------------------------
+# Second review round
+# ---------------------------------------------------------------------------
+
+
+def test_push_mapping_preserves_containers(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla
+) -> None:
+    """`push --map` builds structured records rather than flattening them.
+
+    Reusing the export-oriented scalarization meant a mapping that produced a
+    `fields` dict reached `records.log()` as a JSON string, which Argilla
+    rejects.
+    """
+    Path("in.jsonl").write_text(
+        json.dumps({"body": {"text": "hi"}, "tags": ["a", "b"]}) + "\n",
+        encoding="utf-8",
+    )
+    Path("map.json").write_text(
+        json.dumps({"fields": "body", "labels": "tags"}), encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "push",
+            "intents",
+            "-w",
+            "nlp-lab",
+            "--from",
+            "in.jsonl",
+            "--map",
+            "map.json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    logged = intents.records.logged[0]
+    assert logged["fields"] == {"text": "hi"}
+    assert logged["labels"] == ["a", "b"]
+
+
+def test_push_can_still_opt_into_flattening(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla
+) -> None:
+    """An explicit --list-policy on push still flattens, for flat schemas."""
+    Path("in.jsonl").write_text(
+        json.dumps({"tags": ["a", "b"]}) + "\n", encoding="utf-8"
+    )
+    Path("map.json").write_text(json.dumps({"labels": "tags"}), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "push",
+            "intents",
+            "-w",
+            "nlp-lab",
+            "--from",
+            "in.jsonl",
+            "--map",
+            "map.json",
+            "--list-policy",
+            "join",
+            "--list-sep",
+            "|",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    assert intents.records.logged[0]["labels"] == "a|b"
+
+
+def test_download_mapping_still_flattens_by_default(
+    runner: CliRunner, credentials: None
+) -> None:
+    """Export keeps its flattening default; only push changed."""
+    Path("map.json").write_text(json.dumps({"text": "fields"}), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["dataset", "download", "reviews", "-w", "nlp-lab", "--map", "map.json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    first = json.loads(
+        Path("reviews.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert isinstance(first["text"], str)
+
+
+def test_hub_preflight_checks_jinja2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Hub check fails when jinja2 is absent.
+
+    argilla depends on `datasets` and `huggingface_hub` itself, so a check
+    covering only those two passes in a base install and never fires. jinja2
+    is the dependency the `hub` extra actually adds.
+    """
+    import builtins
+
+    from argilla_cli.commands.dataset import _require_hub
+    from argilla_cli.errors import MissingExtraError
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "jinja2":
+            raise ImportError("No module named 'jinja2'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    with pytest.raises(MissingExtraError) as excinfo:
+        _require_hub()
+    assert excinfo.value.exit_code == 13
+    assert "argilla-cli[hub]" in str(excinfo.value)
+
+
+def test_missing_parquet_engine_on_read_is_validation_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing Parquet engine on read exits 13 with install guidance.
+
+    The write path already mapped this; the read path let a bare ImportError
+    escape as a generic exit 1.
+    """
+    import pandas as pd
+
+    from argilla_cli.errors import MissingExtraError
+
+    target = tmp_path / "records.parquet"
+    write_records([{"id": "r1"}], target, RecordFormat.PARQUET)
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise ImportError("Unable to find a usable engine")
+
+    monkeypatch.setattr(pd, "read_parquet", boom)
+
+    with pytest.raises(MissingExtraError) as excinfo:
+        read_records(target, RecordFormat.PARQUET)
+    assert excinfo.value.exit_code == 13
+    assert "argilla-cli[export]" in str(excinfo.value)

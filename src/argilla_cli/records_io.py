@@ -27,11 +27,19 @@ class RecordFormat(StrEnum):
 
 
 class ListPolicy(StrEnum):
-    """What to do when a mapping expression yields a list."""
+    """What a mapping expression's container results collapse to.
+
+    ``join``/``first``/``error`` are export policies: they flatten lists (and
+    JSON-encode dicts) so the result fits a tabular cell. ``preserve`` keeps
+    containers intact, which is what building structured records for upload
+    needs -- Argilla properties such as ``fields``, ``metadata``,
+    ``suggestions`` and ``vectors`` are mappings and lists, not strings.
+    """
 
     JOIN = "join"
     FIRST = "first"
     ERROR = "error"
+    PRESERVE = "preserve"
 
 
 _SUFFIX_TO_FORMAT = {
@@ -114,11 +122,18 @@ def transform_record(
     list_policy: ListPolicy = ListPolicy.JOIN,
     list_sep: str = ", ",
 ) -> dict[str, Any]:
-    """Apply a compiled mapping to one record, flattening to scalar values."""
+    """Apply a compiled mapping to one record.
+
+    Under every policy but ``preserve`` the result is flattened to scalars,
+    which is right for export and wrong for upload: a mapping that builds a
+    ``fields`` dict must stay a dict for ``records.log()`` to accept it.
+    """
     out: dict[str, Any] = {}
     for key, expression in compiled.items():
         value = expression.search(record)
-        if isinstance(value, list):
+        if list_policy is ListPolicy.PRESERVE:
+            out[key] = value
+        elif isinstance(value, list):
             if list_policy is ListPolicy.JOIN:
                 out[key] = list_sep.join("" if v is None else str(v) for v in value)
             elif list_policy is ListPolicy.FIRST:
@@ -313,7 +328,14 @@ def read_records(path: Path, fmt: RecordFormat) -> list[dict[str, Any]]:
             ]
 
     pd = _require_pandas()
-    frame = pd.read_parquet(path)
+    try:
+        frame = pd.read_parquet(path)
+    except ImportError as exc:
+        # pandas can be present while no Parquet engine is. Mirror the write
+        # path so this exits 13 with install guidance, not a generic 1.
+        raise MissingExtraError(
+            "Parquet support", "export", "argilla-cli[export]"
+        ) from exc
     return [
         {k: _unscalarize(v) for k, v in record.items()}
         for record in frame.to_dict(orient="records")
