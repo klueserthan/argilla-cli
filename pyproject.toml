@@ -84,7 +84,11 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
-python_version = "3.11"
+# Deliberately unpinned: mypy defaults to the interpreter it runs under, which
+# is the one that built the venv it is analysing. Pinning python_version = 3.11
+# while checking a 3.12+ environment makes mypy parse that environment's stubs
+# (numpy's, via the `export` extra) under 3.11 rules and fail on `type`
+# statements. The CI matrix covers 3.11-3.13 separately.
 files = ["src"]
 warn_unused_configs = true
 warn_redundant_casts = true
