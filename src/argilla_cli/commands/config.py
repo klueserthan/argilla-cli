@@ -14,6 +14,7 @@ from argilla_cli.options import confirm
 from argilla_cli.profiles import (
     DEFAULT_PROFILE,
     PROFILE_KEYS,
+    ProfileStore,
     load_store,
     save_store,
     validate_key,
@@ -70,7 +71,9 @@ def doctor() -> None:
 
     ok, error = check_connectivity(ctx.client())
     if not ok:
-        exit_with_error(Exception(error or "connectivity check failed"))
+        # Pass the original exception through so an auth failure exits 10 and
+        # a server/transport failure exits 11, rather than a generic 1.
+        exit_with_error(error or Exception("connectivity check failed"))
     print_ok(f"Argilla connectivity OK ({info.settings.api_url})")
 
     token = info.settings.hf_token
@@ -99,6 +102,18 @@ def list_profiles() -> None:
     render(rows, empty_message=f"(no profiles configured in {store.path})")
 
 
+def _target_profile(store: ProfileStore, requested: str | None) -> str:
+    """Resolve which profile a read/write targets.
+
+    Delegates to the store so the precedence matches everywhere:
+    explicit flag > ``$ARGILLA_CLI_PROFILE`` > the current profile. Resolving
+    this by hand skipped the environment variable, which meant
+    ``ARGILLA_CLI_PROFILE=staging argilla-cli config set api_key ...`` would
+    silently write the key into whichever profile happened to be current.
+    """
+    return store.resolve_name(requested or ctx.profile) or DEFAULT_PROFILE
+
+
 @app.command("set")
 @handle_errors
 def set_value(
@@ -116,7 +131,7 @@ def set_value(
     """Set a configuration value in a profile."""
     validate_key(key)
     store = load_store()
-    name = profile or ctx.profile or store.current or DEFAULT_PROFILE
+    name = _target_profile(store, profile)
 
     store.profiles.setdefault(name, {})[key] = value
     if store.current is None:
@@ -136,7 +151,7 @@ def get_value(
     """Read a single configuration value from a profile."""
     validate_key(key)
     store = load_store()
-    name = profile or ctx.profile or store.current or DEFAULT_PROFILE
+    name = _target_profile(store, profile)
     values = store.get(name)
     if key not in values:
         raise ValidationError(f"{key!r} is not set in profile {name!r}")

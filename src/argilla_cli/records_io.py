@@ -201,9 +201,37 @@ def filter_completed(
 
 
 def _scalarize(value: Any) -> Any:
+    """Flatten a nested value into something a tabular format can hold."""
     if isinstance(value, list | dict):
         return json.dumps(value, ensure_ascii=False, default=str)
     return value
+
+
+def _unscalarize(value: Any) -> Any:
+    """Inverse of :func:`_scalarize`, for reading tabular formats back.
+
+    CSV and Parquet have no nested types, so ``fields``/``metadata``/
+    ``suggestions`` are written as JSON text. Without decoding them on the way
+    back in, ``download --fmt csv`` followed by ``push --fmt csv`` -- the
+    documented inverse workflow -- would hand Argilla strings where it expects
+    mappings, and the records would be rejected or silently mistyped.
+
+    Only values that both look like JSON containers *and* parse as one are
+    decoded, so ordinary prose is left alone. A text field whose literal
+    content is valid JSON (e.g. ``[1, 2]``) does round-trip to a list; that
+    ambiguity is inherent to untyped formats, and JSONL is the lossless
+    choice when it matters.
+    """
+    if not isinstance(value, str):
+        return value
+    candidate = value.strip()
+    if not candidate.startswith(("{", "[")):
+        return value
+    try:
+        decoded = json.loads(candidate)
+    except ValueError:
+        return value
+    return decoded if isinstance(decoded, list | dict) else value
 
 
 def write_records(rows: Iterable[dict[str, Any]], path: Path, fmt: RecordFormat) -> int:
@@ -275,14 +303,20 @@ def read_records(path: Path, fmt: RecordFormat) -> list[dict[str, Any]]:
                 rows.append(payload)
         return rows
 
+    # CSV and Parquet cells are flat, so undo the JSON encoding that
+    # write_records applied to nested values.
     if fmt is RecordFormat.CSV:
         with path.open(encoding="utf-8", newline="") as handle:
-            return [dict(row) for row in csv.DictReader(handle)]
+            return [
+                {k: _unscalarize(v) for k, v in row.items()}
+                for row in csv.DictReader(handle)
+            ]
 
     pd = _require_pandas()
     frame = pd.read_parquet(path)
     return [
-        {k: v for k, v in record.items()} for record in frame.to_dict(orient="records")
+        {k: _unscalarize(v) for k, v in record.items()}
+        for record in frame.to_dict(orient="records")
     ]
 
 

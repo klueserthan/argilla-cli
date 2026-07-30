@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import islice
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -85,10 +86,15 @@ def _build_rows(
     """
     # JMESPath expressions address the nested record structure, so mapping
     # always runs against unflattened records.
-    rows = iter_dataset_records(
-        dataset, flatten=flatten and map_file is None, limit=limit
-    )
+    rows = iter_dataset_records(dataset, flatten=flatten and map_file is None)
     rows = filter_completed(rows, completed_only)
+
+    # The limit caps what is *exported*, so it applies after filtering.
+    # Capping the source stream instead meant `--limit 10 --completed-only`
+    # read the first ten records and could yield nothing, even with plenty of
+    # completed records further down.
+    if limit is not None:
+        rows = islice(rows, limit)
 
     if map_file is None:
         return rows

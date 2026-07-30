@@ -27,13 +27,19 @@ def get_client(settings: Settings) -> rg.Argilla:
     )
 
 
-def check_connectivity(client: Any) -> tuple[bool, str | None]:
-    """Lightweight connectivity/auth probe. Returns ``(ok, error)``."""
+def check_connectivity(client: Any) -> tuple[bool, Exception | None]:
+    """Lightweight connectivity/auth probe. Returns ``(ok, exception)``.
+
+    The original exception is returned rather than its message: Argilla's API
+    errors carry the status code that ``map_exception`` classifies on, so
+    stringifying here would collapse a 401 and a 503 into the same generic
+    failure and lose the documented 10-vs-11 exit codes.
+    """
     try:
         list(client.workspaces)
         return True, None
     except Exception as exc:  # classified by the caller into an exit code
-        return False, str(exc)
+        return False, exc
 
 
 def server_info(client: Any) -> dict[str, Any]:
