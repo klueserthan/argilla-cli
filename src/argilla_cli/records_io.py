@@ -170,13 +170,19 @@ def iter_dataset_records(
 
     ``to_list`` remains the path when ``flatten`` is requested, since only it
     can produce the dotted-key form.
+
+    Streaming goes through ``iter(records)`` rather than ``records()``. Both
+    return the SDK's lazy iterator, but iteration is the narrower contract:
+    it depends only on the accessor being iterable, not on the signature of
+    its ``__call__``. ``test_sdk_contract`` pins that assumption against the
+    real SDK so a future change is caught here rather than in the field.
     """
     records = getattr(dataset, "records", None)
     if records is None:
         raise ValidationError("dataset does not expose records")
 
-    if not flatten and callable(records):
-        yield from _stream_records(records)
+    if not flatten and hasattr(records, "__iter__"):
+        yield from _stream_records(records, limit)
         return
 
     to_list = getattr(records, "to_list", None)
@@ -202,10 +208,10 @@ def iter_dataset_records(
         yield _as_dict(row, index)
 
 
-def _stream_records(records: Any) -> Iterator[dict[str, Any]]:
+def _stream_records(records: Any, limit: int | None = None) -> Iterator[dict[str, Any]]:
     """Page through the dataset's records, fetching only what is consumed."""
     try:
-        iterator = iter(records())
+        iterator = iter(records)
     except Exception as exc:
         if is_classified(exc):
             raise
@@ -213,6 +219,8 @@ def _stream_records(records: Any) -> Iterator[dict[str, Any]]:
 
     index = 0
     while True:
+        if limit is not None and index >= limit:
+            return
         try:
             record = next(iterator)
         except StopIteration:

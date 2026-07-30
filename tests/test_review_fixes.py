@@ -717,11 +717,9 @@ def test_record_fetch_failures_keep_their_exit_code(
     """
     workspace = FakeWorkspace("nlp-lab")
     dataset = FakeDataset("boom", "nlp-lab", [])
-
-    def failing_to_list(flatten: bool = False) -> Any:
-        raise _ApiError("record page failed", status_code)
-
-    monkeypatch.setattr(dataset.records, "to_list", failing_to_list)
+    dataset.records = _FailingRecords(  # type: ignore[assignment]
+        _ApiError("record page failed", status_code)
+    )
     _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[dataset]))
 
     result = runner.invoke(app, ["dataset", "download", "boom", "-w", "nlp-lab"])
@@ -735,11 +733,9 @@ def test_unrecognised_record_failure_still_gets_context(
     """An unclassifiable failure keeps its explanatory wrapper."""
     workspace = FakeWorkspace("nlp-lab")
     dataset = FakeDataset("boom", "nlp-lab", [])
-
-    def failing_to_list(flatten: bool = False) -> Any:
-        raise TypeError("something structural")
-
-    monkeypatch.setattr(dataset.records, "to_list", failing_to_list)
+    dataset.records = _FailingRecords(  # type: ignore[assignment]
+        TypeError("something structural")
+    )
     _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[dataset]))
 
     result = runner.invoke(app, ["dataset", "download", "boom", "-w", "nlp-lab"])
@@ -846,20 +842,36 @@ def test_push_of_native_parquet_reaches_the_server(
     assert len(intents.records.logged) == 1
 
 
+class _FailingRecords:
+    """Records whose iteration fails, as a mid-fetch network error would."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        raise self.error
+
+    def to_list(self, flatten: bool = False) -> list[dict[str, Any]]:
+        raise self.error
+
+
 class _StreamingRecords:
-    """Records that page lazily, and count how many were actually fetched."""
+    """Records that page lazily, and count how many were actually fetched.
+
+    Shaped like the SDK's accessor: streaming is reached through ``__iter__``,
+    not a zero-argument ``__call__``. An earlier version of this double
+    defined ``__call__`` and so would have passed even if the production code
+    depended on a call signature the real SDK does not offer.
+    """
 
     def __init__(self, rows: list[dict[str, Any]]) -> None:
         self.rows = rows
         self.fetched = 0
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Iterator[dict[str, Any]]:
-        def generate() -> Iterator[dict[str, Any]]:
-            for row in self.rows:
-                self.fetched += 1
-                yield row
-
-        return generate()
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for row in self.rows:
+            self.fetched += 1
+            yield row
 
     def to_list(self, flatten: bool = False) -> list[dict[str, Any]]:
         self.fetched = len(self.rows)
@@ -975,11 +987,9 @@ def test_copy_does_not_create_when_the_source_read_fails(
 
     workspace = FakeWorkspace("nlp-lab")
     source = FakeDataset("src", "nlp-lab", [])
-
-    def failing_to_list(flatten: bool = False) -> Any:
-        raise _ApiError("source unreadable", 503)
-
-    monkeypatch.setattr(source.records, "to_list", failing_to_list)
+    source.records = _FailingRecords(  # type: ignore[assignment]
+        _ApiError("source unreadable", 503)
+    )
     _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[source]))
 
     created: list[Any] = []
