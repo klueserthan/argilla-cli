@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from argilla_cli.errors import map_exception
 from argilla_cli.main import app
 from argilla_cli.records_io import RecordFormat, read_records, write_records
 
@@ -1008,3 +1009,129 @@ def test_copy_does_not_create_when_the_source_read_fails(
 
     assert result.exit_code == 11, result.output
     assert created == [], "nothing should have been created"
+
+
+# ---------------------------------------------------------------------------
+# Eighth review round
+# ---------------------------------------------------------------------------
+
+
+def test_flatten_with_limit_also_stops_fetching_early(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--flatten --limit N` must stream too, not materialise everything.
+
+    The flatten path went through eager to_list(), so this documented
+    combination kept the full-download failure mode after streaming landed.
+    """
+    workspace = FakeWorkspace("nlp-lab")
+    dataset = FakeDataset("big", "nlp-lab", [])
+    streaming = _StreamingRecords(
+        [{"id": f"r{i}", "fields": {"text": f"t{i}"}} for i in range(1000)]
+    )
+    dataset.records = streaming  # type: ignore[assignment]
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[dataset]))
+
+    result = runner.invoke(
+        app,
+        ["dataset", "download", "big", "-w", "nlp-lab", "--flatten", "--limit", "5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = Path("big.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 5
+    assert "fields.text" in json.loads(lines[0])
+    assert streaming.fetched < 50, f"fetched {streaming.fetched} for a limit of 5"
+
+
+def test_failed_download_does_not_destroy_the_existing_file(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A download that fails part-way leaves the previous export intact.
+
+    Writing straight to the destination truncated it on open, so a failure
+    mid-stream destroyed a good file and left a partial one behind.
+    """
+    workspace = FakeWorkspace("nlp-lab")
+    dataset = FakeDataset("boom", "nlp-lab", [])
+
+    class _HalfBroken:
+        def __iter__(self) -> Iterator[dict[str, Any]]:
+            yield {"id": "r1"}
+            raise _ApiError("connection dropped", 503)
+
+    dataset.records = _HalfBroken()  # type: ignore[assignment]
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[dataset]))
+
+    target = Path("boom.jsonl")
+    target.write_text("PREVIOUS GOOD EXPORT\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["dataset", "download", "boom", "-w", "nlp-lab", "--force"]
+    )
+
+    assert result.exit_code == 11, result.output
+    assert target.read_text(encoding="utf-8") == "PREVIOUS GOOD EXPORT\n"
+    leftovers = [p.name for p in Path().iterdir() if p.name.endswith(".partial")]
+    assert leftovers == [], f"temporary files left behind: {leftovers}"
+
+
+def test_successful_download_replaces_the_target(
+    runner: CliRunner, credentials: None
+) -> None:
+    """The atomic write still produces the file on the happy path."""
+    Path("reviews.jsonl").write_text("stale\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["dataset", "download", "reviews", "-w", "nlp-lab", "--force"]
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = Path("reviews.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    assert "stale" not in lines[0]
+
+
+def test_pydantic_validation_errors_are_bad_input() -> None:
+    """A model rejecting user data exits 13, not an unclassified 1."""
+    import pydantic
+
+    from argilla_cli.errors import ValidationError as CLIValidationError
+
+    class Model(pydantic.BaseModel):
+        count: int
+
+    try:
+        Model(count="not a number")  # type: ignore[arg-type]
+    except pydantic.ValidationError as exc:
+        mapped = map_exception(exc)
+        assert isinstance(mapped, CLIValidationError)
+        assert mapped.exit_code == 13
+    else:  # pragma: no cover - the model must reject this
+        raise AssertionError("expected a validation error")
+
+
+@pytest.mark.parametrize(
+    "error_name",
+    [
+        "RecordsIngestionError",
+        "SettingsError",
+        "MetadataError",
+        "ArgillaSerializeError",
+    ],
+)
+def test_argilla_local_errors_are_bad_input(error_name: str) -> None:
+    """Argilla's local validation errors are input problems, not network ones.
+
+    These are raised while serialising or ingesting what the user supplied.
+    Reporting `RecordsIngestionError` as exit 11 told people to check their
+    connection when their records were malformed.
+    """
+    import argilla._exceptions as exceptions
+
+    from argilla_cli.errors import ValidationError as CLIValidationError
+
+    mapped = map_exception(getattr(exceptions, error_name)("bad input"))
+
+    assert isinstance(mapped, CLIValidationError), f"{error_name} -> {type(mapped)}"
+    assert mapped.exit_code == 13

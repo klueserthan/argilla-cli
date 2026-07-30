@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import tempfile
 from collections.abc import Iterable, Iterator
 from enum import StrEnum
 from pathlib import Path
@@ -181,9 +183,11 @@ def iter_dataset_records(
     if records is None:
         raise ValidationError("dataset does not expose records")
 
-    if not flatten and hasattr(records, "__iter__"):
-        yield from _stream_records(records, limit)
-        return
+    if hasattr(records, "__iter__"):
+        flattener = _record_flattener() if flatten else None
+        if flattener is not None or not flatten:
+            yield from _stream_records(records, limit, flattener)
+            return
 
     to_list = getattr(records, "to_list", None)
     if not callable(to_list):
@@ -208,7 +212,30 @@ def iter_dataset_records(
         yield _as_dict(row, index)
 
 
-def _stream_records(records: Any, limit: int | None = None) -> Iterator[dict[str, Any]]:
+def _record_flattener() -> Any | None:
+    """The SDK's per-record flattener, if this version exposes one.
+
+    ``to_list(flatten=True)`` is just a loop over this same function, so
+    applying it to a streamed record produces byte-identical rows -- which
+    means ``--flatten`` can be lazy too, instead of materialising the whole
+    dataset before ``--limit`` has any say.
+
+    It is a private helper, so its absence is treated as "no lazy flatten
+    available" rather than an error, and the eager ``to_list`` path is used
+    instead. ``test_sdk_contract`` fails loudly if it moves, so the
+    degradation is noticed rather than silently shipped.
+    """
+    try:
+        from argilla.records._io._generic import GenericIO
+    except ImportError:  # pragma: no cover - depends on SDK internals
+        return None
+    flattener = getattr(GenericIO, "_record_to_dict", None)
+    return flattener if callable(flattener) else None
+
+
+def _stream_records(
+    records: Any, limit: int | None = None, flattener: Any | None = None
+) -> Iterator[dict[str, Any]]:
     """Page through the dataset's records, fetching only what is consumed."""
     try:
         iterator = iter(records)
@@ -231,8 +258,35 @@ def _stream_records(records: Any, limit: int | None = None) -> Iterator[dict[str
             if is_classified(exc):
                 raise
             raise ValidationError(f"failed to read records: {exc}") from exc
-        yield _as_dict(record, index)
+
+        if flattener is None:
+            yield _as_dict(record, index)
+        else:
+            try:
+                # SDK records go through the SDK's own flattener, so the rows
+                # match to_list(flatten=True) exactly. A record that is
+                # already a plain mapping is flattened directly.
+                if isinstance(record, dict):
+                    yield _flatten_mapping(record)
+                else:
+                    yield _flatten_mapping(dict(flattener(record, True)))
+            except Exception as exc:
+                raise ValidationError(
+                    f"failed to flatten record {index}: {exc}"
+                ) from exc
         index += 1
+
+
+def _flatten_mapping(row: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Collapse nested mappings into dotted keys, as ``flatten=True`` does."""
+    flat: dict[str, Any] = {}
+    for key, value in row.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(_flatten_mapping(value, prefix=f"{name}."))
+        else:
+            flat[name] = value
+    return flat
 
 
 def _as_dict(record: Any, index: int) -> dict[str, Any]:
@@ -346,9 +400,36 @@ def _unscalarize(value: Any) -> Any:
 
 
 def write_records(rows: Iterable[dict[str, Any]], path: Path, fmt: RecordFormat) -> int:
-    """Write records to ``path``. Returns the number of records written."""
+    """Write records to ``path`` atomically. Returns the number written.
+
+    The export goes to a temporary sibling and only replaces the target once
+    it has finished. Writing straight to the destination truncated it the
+    moment the file was opened, so a stream that failed part-way left a
+    half-written export in place -- and with ``--force``, destroyed a
+    previously good one before knowing the replacement would succeed.
+
+    The temporary file shares the target's directory so that ``os.replace``
+    is a same-filesystem rename, which is atomic.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    handle_fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".partial"
+    )
+    os.close(handle_fd)
+    tmp_path = Path(tmp_name)
+
+    try:
+        count = _write_to(rows, tmp_path, fmt)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return count
+
+
+def _write_to(rows: Iterable[dict[str, Any]], path: Path, fmt: RecordFormat) -> int:
+    """Serialise records to ``path``. Callers handle atomicity."""
     if fmt is RecordFormat.JSONL:
         count = 0
         with path.open("w", encoding="utf-8") as handle:

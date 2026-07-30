@@ -118,3 +118,18 @@ def test_user_roles_match_the_cli_enum() -> None:
     from argilla_cli.commands.user import UserRole
 
     assert {r.value for r in UserRole} == {r.value for r in Role}
+
+
+def test_per_record_flattener_is_available() -> None:
+    """Lazy `--flatten` uses the SDK's own per-record flattener.
+
+    `to_list(flatten=True)` is a loop over this function, so applying it to a
+    streamed record yields identical rows. It is private, so the CLI falls
+    back to the eager path if it disappears -- this test makes that
+    degradation visible rather than silent.
+    """
+    from argilla.records._io._generic import GenericIO
+
+    assert callable(GenericIO._record_to_dict)
+    parameters = inspect.signature(GenericIO._record_to_dict).parameters
+    assert "flatten" in parameters

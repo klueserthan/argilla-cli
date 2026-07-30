@@ -126,16 +126,38 @@ def map_exception(exc: BaseException) -> CLIError:
         exc, ConnectionError | TimeoutError
     ):
         return NetworkApiError(message)
+    # A model rejecting data locally is bad input, not an unclassified fault.
+    # These arise when the CLI hands user-supplied records or settings to the
+    # SDK, so they belong in the validation bucket.
+    if module in {"pydantic", "pydantic_core"}:
+        return ValidationError(message)
+
     if module == "argilla":
         if "Credentials" in name or "Unauthorized" in name or "Forbidden" in name:
             return AuthConfigError(message)
         if "NotFound" in name:
             return NotFoundError(message)
-        if "Conflict" in name or "Unprocessable" in name or "BadRequest" in name:
+        if any(marker in name for marker in _ARGILLA_VALIDATION_MARKERS):
             return ValidationError(message)
         return NetworkApiError(message)
 
     return CLIError(message)
+
+
+#: Argilla error names that mean "the input was wrong", not "the server was".
+#: The first three are HTTP-shaped; the rest are raised locally while
+#: serialising or ingesting what the user supplied, and were previously
+#: reported as network failures.
+_ARGILLA_VALIDATION_MARKERS = (
+    "Conflict",
+    "Unprocessable",
+    "BadRequest",
+    "RecordsIngestion",
+    "Settings",
+    "Metadata",
+    "Serialize",
+    "ImportDataset",
+)
 
 
 def is_classified(exc: BaseException) -> bool:
