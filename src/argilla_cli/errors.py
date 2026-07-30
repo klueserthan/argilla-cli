@@ -138,6 +138,17 @@ def map_exception(exc: BaseException) -> CLIError:
     return CLIError(message)
 
 
+def is_classified(exc: BaseException) -> bool:
+    """True when ``map_exception`` can attribute this to a specific cause.
+
+    Lets a wrapper distinguish "I understand this failure" from "this came
+    from the transport and already carries its own meaning". Wrapping the
+    latter would overwrite an auth or network failure with whatever exit code
+    the wrapping layer happens to use.
+    """
+    return type(map_exception(exc)) is not CLIError
+
+
 def exit_with_error(exc: BaseException, *, verbose: bool | None = None) -> None:
     """Print a concise message and exit with the mapped code."""
     mapped = map_exception(exc)

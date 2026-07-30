@@ -15,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from argilla_cli.errors import MissingExtraError, ValidationError
+from argilla_cli.errors import MissingExtraError, ValidationError, is_classified
 
 
 class RecordFormat(StrEnum):
@@ -171,6 +171,12 @@ def iter_dataset_records(
     try:
         rows = to_list(flatten=flatten)
     except Exception as exc:
+        # Fetching records is a network call. An auth or transport failure
+        # already carries its own meaning, and re-labelling it as a
+        # validation error would report a 401 as exit 13 instead of 10. Only
+        # genuinely unrecognised failures get the record-reading context.
+        if is_classified(exc):
+            raise
         raise ValidationError(f"failed to read records: {exc}") from exc
 
     for index, row in enumerate(rows):

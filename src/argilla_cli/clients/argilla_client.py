@@ -49,17 +49,26 @@ def server_info(client: Any) -> dict[str, Any]:
         raise NetworkApiError("client does not expose an HTTP transport")
 
     info: dict[str, Any] = {}
+    last_error: Exception | None = None
     for label, path in (("version", "/api/v1/version"), ("status", "/api/v1/status")):
         try:
             response = http.get(path)
             response.raise_for_status()
             payload = response.json()
-        except Exception:
+        except Exception as exc:
+            # Endpoints are probed opportunistically -- one may be absent on
+            # older servers -- but the failure is kept so that a total
+            # failure can be reported with its real cause rather than a
+            # blanket network error. A 401 here is an auth problem (10).
+            last_error = exc
             continue
         if isinstance(payload, dict):
             info.update({f"{label}.{k}": v for k, v in payload.items()})
         else:
             info[label] = payload
+
     if not info:
+        if last_error is not None:
+            raise last_error
         raise NetworkApiError("server did not report version or status information")
     return info

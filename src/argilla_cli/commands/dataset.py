@@ -10,7 +10,12 @@ from typing import Annotated, Any
 import typer
 
 from argilla_cli.context import ctx
-from argilla_cli.errors import MissingExtraError, ValidationError, handle_errors
+from argilla_cli.errors import (
+    MissingExtraError,
+    ValidationError,
+    handle_errors,
+    is_classified,
+)
 from argilla_cli.io_utils import print_ok, render
 from argilla_cli.options import LimitOpt, WorkspaceOpt, confirm, resolve_workspace_name
 from argilla_cli.records_io import (
@@ -211,7 +216,18 @@ def create(
     if not settings_file.is_file():
         raise ValidationError(f"settings file not found: {settings_file}")
 
-    settings = rg.Settings.from_json(settings_file)
+    # The settings file is user input, so a parse failure is a validation
+    # error (13), not the generic exit 1 an unrecognised JSON/pydantic
+    # exception would otherwise produce.
+    try:
+        settings = rg.Settings.from_json(settings_file)
+    except Exception as exc:
+        if is_classified(exc):
+            raise
+        raise ValidationError(
+            f"could not read settings from {settings_file}: {exc}"
+        ) from exc
+
     dataset = rg.Dataset(
         name=name, workspace=workspace_name, settings=settings, client=client
     ).create()

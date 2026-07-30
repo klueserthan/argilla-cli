@@ -692,3 +692,109 @@ def test_supported_user_roles_are_accepted(
 
     assert result.exit_code == 0, result.output
     assert captured["role"] == role
+
+
+# ---------------------------------------------------------------------------
+# Fifth review round: exception types must survive their wrappers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_exit"), [(401, 10), (403, 10), (503, 11)]
+)
+def test_record_fetch_failures_keep_their_exit_code(
+    status_code: int,
+    expected_exit: int,
+    runner: CliRunner,
+    credentials: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 while fetching records exits 10, not a validation error 13.
+
+    Fetching records is a network call, so wrapping every failure as a
+    validation error overwrote auth and transport failures with exit 13.
+    """
+    workspace = FakeWorkspace("nlp-lab")
+    dataset = FakeDataset("boom", "nlp-lab", [])
+
+    def failing_to_list(flatten: bool = False) -> Any:
+        raise _ApiError("record page failed", status_code)
+
+    monkeypatch.setattr(dataset.records, "to_list", failing_to_list)
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[dataset]))
+
+    result = runner.invoke(app, ["dataset", "download", "boom", "-w", "nlp-lab"])
+
+    assert result.exit_code == expected_exit, result.output
+
+
+def test_unrecognised_record_failure_still_gets_context(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unclassifiable failure keeps its explanatory wrapper."""
+    workspace = FakeWorkspace("nlp-lab")
+    dataset = FakeDataset("boom", "nlp-lab", [])
+
+    def failing_to_list(flatten: bool = False) -> Any:
+        raise TypeError("something structural")
+
+    monkeypatch.setattr(dataset.records, "to_list", failing_to_list)
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[dataset]))
+
+    result = runner.invoke(app, ["dataset", "download", "boom", "-w", "nlp-lab"])
+
+    assert result.exit_code == 13, result.output
+    assert "failed to read records" in result.output
+
+
+@pytest.mark.parametrize(("status_code", "expected_exit"), [(401, 10), (503, 11)])
+def test_server_info_preserves_probe_failures(
+    status_code: int,
+    expected_exit: int,
+    runner: CliRunner,
+    credentials: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`server info` reports a 401 as auth, not a blanket network error."""
+
+    class Http:
+        def get(self, path: str) -> Any:
+            raise _ApiError(f"{path} failed", status_code)
+
+    client = FakeArgilla()
+    client.http_client = Http()  # type: ignore[attr-defined]
+    _use_client(monkeypatch, client)
+
+    result = runner.invoke(app, ["server", "info"])
+
+    assert result.exit_code == expected_exit, result.output
+
+
+def test_server_info_without_transport_is_a_network_error(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no HTTP transport at all there is no cause to preserve."""
+    _use_client(monkeypatch, FakeArgilla())
+
+    result = runner.invoke(app, ["server", "info"])
+
+    assert result.exit_code == 11, result.output
+
+
+def test_malformed_settings_file_is_a_validation_error(
+    runner: CliRunner, credentials: None
+) -> None:
+    """`dataset create --settings <malformed>` exits 13, not a generic 1.
+
+    The file is user input, so a JSON parse failure belongs to the
+    validation bucket rather than falling through as unclassified.
+    """
+    Path("broken.json").write_text("{not json", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["dataset", "create", "newds", "-w", "nlp-lab", "--settings", "broken.json"],
+    )
+
+    assert result.exit_code == 13, result.output
+    assert "Traceback" not in result.output
