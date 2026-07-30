@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Annotated, Any
 
 import typer
@@ -13,6 +14,21 @@ from argilla_cli.options import WorkspaceOpt, confirm, resolve_workspace_name
 from argilla_cli.resources import list_users, resolve_user, resolve_workspace
 
 app = typer.Typer(help="Manage Argilla users", no_args_is_help=True)
+
+
+class UserRole(StrEnum):
+    """Roles Argilla accepts, mirrored so bad input fails at the CLI boundary.
+
+    Passing an unconstrained string through to the SDK meant an unsupported
+    role surfaced as a pydantic error mapped to a generic exit 1. Declaring
+    the choices here makes it a usage error (exit 2) and lists the valid
+    values in ``--help``.
+    """
+
+    ANNOTATOR = "annotator"
+    ADMIN = "admin"
+    OWNER = "owner"
+
 
 _COLUMNS = ["username", "id", "role", "first_name", "last_name"]
 
@@ -73,7 +89,10 @@ def create(
         str,
         typer.Option(..., prompt=True, hide_input=True, help="User password."),
     ],
-    role: Annotated[str, typer.Option("--role", help="User role.")] = "annotator",
+    role: Annotated[
+        UserRole,
+        typer.Option("--role", help="User role.", case_sensitive=False),
+    ] = UserRole.ANNOTATOR,
     first_name: Annotated[
         str | None, typer.Option("--first-name", help="First name.")
     ] = None,
@@ -88,7 +107,7 @@ def create(
     user = rg.User(
         username=username,
         password=password,
-        role=role,
+        role=role.value,
         first_name=first_name,
         last_name=last_name,
         client=client,

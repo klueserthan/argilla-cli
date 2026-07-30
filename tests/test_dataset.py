@@ -660,7 +660,7 @@ def test_push_empty_file_exits_13(runner: CliRunner, credentials: None) -> None:
 def test_copy_with_records_logs_them_onto_the_new_dataset(
     runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`dataset copy` logs the source's 2 records onto the new dataset."""
+    """`dataset copy` logs the source's 2 records, minus their server ids."""
     import argilla
 
     created: list[FakeDataset] = []
@@ -672,8 +672,12 @@ def test_copy_with_records_logs_them_onto_the_new_dataset(
 
     assert result.exit_code == 0, result.output
     assert len(created) == 1
-    assert len(created[0].records.logged) == 2
-    assert {r["id"] for r in created[0].records.logged} == {"r1", "r2"}
+    logged = created[0].records.logged
+    assert len(logged) == 2
+    # Content carries over; the source's server-assigned ids must not, or the
+    # upsert would target records belonging to the source dataset.
+    assert {r["fields"]["text"] for r in logged} == {"hello", "world"}
+    assert all("id" not in r for r in logged)
 
 
 def test_copy_no_records_flag_copies_nothing(

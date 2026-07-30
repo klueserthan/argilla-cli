@@ -23,6 +23,7 @@ from argilla_cli.records_io import (
     load_mapping,
     read_records,
     resolve_target_path,
+    strip_server_ids,
     transform_record,
     write_records,
 )
@@ -401,7 +402,7 @@ def copy(
 
     count = 0
     if with_records:
-        records = list(iter_dataset_records(source))
+        records = [strip_server_ids(row) for row in iter_dataset_records(source)]
         if records:
             new_dataset.records.log(records)
         count = len(records)

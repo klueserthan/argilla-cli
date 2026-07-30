@@ -196,6 +196,26 @@ def _as_dict(record: Any, index: int) -> dict[str, Any]:
     )
 
 
+#: Keys the server owns and that must not be carried between datasets.
+SERVER_OWNED_KEYS = ("id", "_server_id")
+
+
+def strip_server_ids(record: dict[str, Any]) -> dict[str, Any]:
+    """Drop server-assigned identifiers so a record logs as a new one.
+
+    ``records.log()`` is an upsert: the SDK documents that "if the record
+    includes a known ``id`` field, the record will be updated". Carrying a
+    source dataset's ids into a copy therefore asks the server to update
+    records that belong to a different dataset instead of creating
+    independent ones.
+
+    Deliberately not applied to ``push``: there the file is the user's own,
+    and re-uploading with ids to update existing records is a legitimate
+    workflow rather than an accident.
+    """
+    return {k: v for k, v in record.items() if k not in SERVER_OWNED_KEYS}
+
+
 def filter_completed(
     rows: Iterable[dict[str, Any]], completed_only: bool
 ) -> Iterator[dict[str, Any]]:

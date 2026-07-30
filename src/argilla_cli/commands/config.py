@@ -19,7 +19,7 @@ from argilla_cli.profiles import (
     save_store,
     validate_key,
 )
-from argilla_cli.settings import mask_token
+from argilla_cli.settings import mask_token, validate_value
 
 app = typer.Typer(
     help="Inspect and manage argilla-cli configuration", no_args_is_help=True
@@ -130,6 +130,7 @@ def set_value(
 ) -> None:
     """Set a configuration value in a profile."""
     validate_key(key)
+    validate_value(key, value)
     store = load_store()
     name = _target_profile(store, profile)
 

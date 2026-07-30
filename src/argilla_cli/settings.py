@@ -203,6 +203,23 @@ def load_settings(
     )
 
 
+def validate_value(key: str, value: str) -> None:
+    """Check one setting before it is written to a profile.
+
+    ``config set`` used to persist whatever it was given and report success,
+    so an invalid URL was only discovered by a later command -- leaving a
+    profile that looks configured but cannot connect. Failing at the point of
+    entry keeps the stored config always loadable.
+    """
+    try:
+        Settings(**{key: value})  # type: ignore[arg-type]
+    except PydanticValidationError as exc:
+        detail = exc.errors()[0]["msg"] if exc.errors() else "invalid value"
+        raise ValidationError(
+            f"invalid value for {key}: {detail.removeprefix('Value error, ')}"
+        ) from exc
+
+
 def require_credentials(info: SettingsInfo) -> Settings:
     """Return settings, or raise a helpful ``AuthConfigError`` if incomplete."""
     missing = [

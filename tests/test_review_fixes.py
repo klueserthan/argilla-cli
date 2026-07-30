@@ -16,7 +16,7 @@ from typer.testing import CliRunner
 from argilla_cli.main import app
 from argilla_cli.records_io import RecordFormat, read_records, write_records
 
-from .conftest import FakeArgilla, FakeDataset, FakeWorkspace
+from .conftest import FakeArgilla, FakeDataset, FakeUser, FakeWorkspace
 
 
 class _FailingClient(FakeArgilla):
@@ -573,3 +573,122 @@ def test_from_hub_reports_a_configuration_url_clearly(
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["configure_url"].startswith("https://")
+
+
+# ---------------------------------------------------------------------------
+# Fourth review round
+# ---------------------------------------------------------------------------
+
+
+def test_copy_does_not_carry_server_ids(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Copied records must not reuse the source's server-assigned ids.
+
+    records.log() is an upsert -- the SDK documents that a record carrying a
+    known `id` is *updated*. Copying ids across would ask the server to touch
+    the source dataset's records instead of creating independent ones.
+    """
+    import argilla
+
+    workspace = FakeWorkspace("nlp-lab")
+    source = FakeDataset(
+        "src",
+        "nlp-lab",
+        [
+            {"id": "r1", "_server_id": "s1", "fields": {"text": "a"}},
+            {"id": "r2", "_server_id": "s2", "fields": {"text": "b"}},
+        ],
+    )
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[source]))
+
+    created: list[FakeDataset] = []
+
+    def factory(**kwargs: Any) -> Any:
+        dataset = FakeDataset(kwargs.get("name", "copy"), "nlp-lab", [])
+
+        class _Wrapper:
+            def create(self) -> FakeDataset:
+                created.append(dataset)
+                return dataset
+
+        return _Wrapper()
+
+    monkeypatch.setattr(argilla, "Dataset", factory)
+
+    result = runner.invoke(app, ["dataset", "copy", "src", "src-copy", "-w", "nlp-lab"])
+
+    assert result.exit_code == 0, result.output
+    logged = created[0].records.logged
+    assert len(logged) == 2
+    assert all("id" not in r and "_server_id" not in r for r in logged)
+    assert {r["fields"]["text"] for r in logged} == {"a", "b"}
+
+
+@pytest.mark.parametrize("bad_url", ["ftp://host", "https://:bad", "notaurl"])
+def test_config_set_rejects_invalid_urls_before_writing(
+    bad_url: str, runner: CliRunner
+) -> None:
+    """`config set api_url` validates up front instead of storing junk.
+
+    Persisting an unusable value and reporting success left a profile that
+    looks configured but cannot connect, with the error only surfacing later.
+    """
+    result = runner.invoke(app, ["config", "set", "api_url", bad_url])
+
+    assert result.exit_code == 13, result.output
+
+    listed = runner.invoke(app, ["-o", "json", "config", "list"])
+    assert bad_url not in listed.stdout
+
+
+def test_config_set_still_accepts_a_valid_url(runner: CliRunner) -> None:
+    """The guard does not block legitimate values."""
+    result = runner.invoke(
+        app, ["config", "set", "api_url", "https://argilla.example.com"]
+    )
+    assert result.exit_code == 0, result.output
+
+    got = runner.invoke(app, ["-o", "json", "config", "get", "api_url"])
+    assert json.loads(got.stdout)["value"] == "https://argilla.example.com"
+
+
+def test_unsupported_user_role_is_a_usage_error(runner: CliRunner) -> None:
+    """An invalid --role fails at the CLI boundary, not as a generic error.
+
+    The unconstrained string used to reach the SDK, whose pydantic failure
+    mapped to exit 1. The enum makes it a usage error and lists the choices.
+    """
+    result = runner.invoke(
+        app, ["user", "create", "jane", "--password", "pw", "--role", "superadmin"]
+    )
+
+    assert result.exit_code == 2, result.output
+
+
+@pytest.mark.parametrize("role", ["annotator", "admin", "owner"])
+def test_supported_user_roles_are_accepted(
+    role: str, runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All three roles Argilla defines still work, `owner` included."""
+    import argilla
+
+    captured: dict[str, Any] = {}
+
+    def factory(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+
+        class _Wrapper:
+            def create(self) -> FakeUser:
+                return FakeUser(kwargs["username"], role=kwargs["role"])
+
+        return _Wrapper()
+
+    monkeypatch.setattr(argilla, "User", factory)
+
+    result = runner.invoke(
+        app, ["user", "create", "jane", "--password", "pw", "--role", role]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["role"] == role
