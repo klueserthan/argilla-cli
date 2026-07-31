@@ -439,7 +439,12 @@ def copy(
             new_dataset.records.log(batch)
             count += len(batch)
             batch = list(islice(stream, _COPY_BATCH_SIZE))
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: a Ctrl+C part-way through a long copy
+        # is precisely when a half-populated dataset gets left behind, and
+        # KeyboardInterrupt would slip past the narrower clause. This matches
+        # how write_records guards its temporary file.
+        #
         # The dataset exists but is empty or partial. Remove it rather than
         # leave an artifact that makes retrying the same name fail.
         try:

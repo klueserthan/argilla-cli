@@ -1405,3 +1405,57 @@ def test_copy_rolls_back_when_a_later_batch_fails(
 
     assert result.exit_code == 13, result.output
     assert created[0].deleted is True, "destination should have been rolled back"
+
+
+# ---------------------------------------------------------------------------
+# Eleventh review round
+# ---------------------------------------------------------------------------
+
+
+def test_copy_rolls_back_on_keyboard_interrupt(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl+C during a copy still removes the half-made destination.
+
+    KeyboardInterrupt derives from BaseException, so an `except Exception`
+    rollback lets it past -- and a long copy is exactly when someone reaches
+    for Ctrl+C.
+    """
+    import argilla
+
+    from argilla_cli.commands.dataset import _COPY_BATCH_SIZE
+
+    workspace = FakeWorkspace("nlp-lab")
+    source = FakeDataset("src", "nlp-lab", [])
+    source.records = _StreamingRecords(  # type: ignore[assignment]
+        [{"id": f"r{i}"} for i in range(_COPY_BATCH_SIZE * 2)]
+    )
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[source]))
+
+    created: list[FakeDataset] = []
+
+    def factory(**kwargs: Any) -> Any:
+        dataset = FakeDataset(kwargs.get("name", "copy"), "nlp-lab", [])
+        calls = {"n": 0}
+
+        def interrupted_log(records: list[dict[str, Any]]) -> None:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise KeyboardInterrupt()
+
+        dataset.records.log = interrupted_log  # type: ignore[assignment]
+
+        class _Wrapper:
+            def create(self) -> FakeDataset:
+                created.append(dataset)
+                return dataset
+
+        return _Wrapper()
+
+    monkeypatch.setattr(argilla, "Dataset", factory)
+
+    runner.invoke(app, ["dataset", "copy", "src", "src-copy", "-w", "nlp-lab"])
+
+    assert created and created[0].deleted is True, (
+        "destination should be rolled back even on interrupt"
+    )

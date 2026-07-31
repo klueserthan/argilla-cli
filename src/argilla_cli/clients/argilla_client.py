@@ -42,9 +42,27 @@ def check_connectivity(client: Any) -> tuple[bool, Exception | None]:
         return False, exc
 
 
+def _http_transport(client: Any) -> Any | None:
+    """Locate the SDK's HTTP client.
+
+    ``APIClient.__init__`` sets ``self.http_client`` and then builds
+    ``self.api`` from it, so the direct attribute is the primary lookup. The
+    ``client.api`` fallback costs one ``getattr`` and means a future
+    reshuffle of where the transport hangs degrades into "still works"
+    rather than "server info silently reports no transport".
+    """
+    for candidate in (
+        getattr(client, "http_client", None),
+        getattr(getattr(client, "api", None), "http_client", None),
+    ):
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def server_info(client: Any) -> dict[str, Any]:
     """Fetch server version/status via the SDK's underlying HTTP client."""
-    http = getattr(client, "http_client", None)
+    http = _http_transport(client)
     if http is None:
         raise NetworkApiError("client does not expose an HTTP transport")
 

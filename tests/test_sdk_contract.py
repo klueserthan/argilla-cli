@@ -133,3 +133,38 @@ def test_per_record_flattener_is_available() -> None:
     assert callable(GenericIO._record_to_dict)
     parameters = inspect.signature(GenericIO._record_to_dict).parameters
     assert "flatten" in parameters
+
+
+def test_client_exposes_the_http_transport_directly() -> None:
+    """`server info` reads the transport off the client itself.
+
+    APIClient.__init__ assigns `self.http_client` and then builds `self.api`
+    from it, so the direct attribute is the real one. Asserted against the
+    SDK because the fake client in the other tests attaches `http_client`
+    by hand -- it would look identical whether or not this held.
+    """
+    from argilla._api._client import APIClient
+
+    source = inspect.getsource(APIClient.__init__)
+    assert "self.http_client" in source
+    # ...and `api` is derived from it, not the other way round.
+    assert "ArgillaAPI(self.http_client)" in source
+
+
+def test_transport_lookup_finds_either_location() -> None:
+    """The lookup tolerates the transport moving under `client.api`."""
+    from argilla_cli.clients.argilla_client import _http_transport
+
+    class Direct:
+        http_client = "transport"
+
+    class ViaApi:
+        class api:  # noqa: N801 - mimicking an attribute namespace
+            http_client = "transport"
+
+    class Neither:
+        pass
+
+    assert _http_transport(Direct()) == "transport"
+    assert _http_transport(ViaApi()) == "transport"
+    assert _http_transport(Neither()) is None
