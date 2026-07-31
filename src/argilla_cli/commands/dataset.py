@@ -43,6 +43,11 @@ app = typer.Typer(help="Manage Argilla datasets", no_args_is_help=True)
 
 _COLUMNS = ["name", "workspace", "id", "created_at", "description"]
 
+#: How many records `dataset copy` holds in memory at once. The SDK pages the
+#: source at a smaller size and batches its own uploads, so this only bounds
+#: what the CLI itself accumulates between the two.
+_COPY_BATCH_SIZE = 500
+
 MapOpt = Annotated[
     Path | None,
     typer.Option(
@@ -409,13 +414,17 @@ def copy(
         raise ValidationError("could not determine the destination workspace")
     resolve_workspace(client, destination)
 
-    # Read the source before creating anything, so a fetch failure leaves no
-    # half-made dataset behind to collide with the next attempt.
-    records = (
-        [strip_server_ids(row) for row in iter_dataset_records(source)]
+    # Records are copied in batches so that a large source does not have to
+    # fit in memory. The first batch is read *before* the destination is
+    # created, which keeps the property that an unreadable source -- a 401, a
+    # missing dataset, a dropped connection -- leaves nothing behind at all.
+    # Anything that fails later is handled by the rollback below.
+    stream = (
+        (strip_server_ids(row) for row in iter_dataset_records(source))
         if with_records
-        else []
+        else iter(())
     )
+    batch = list(islice(stream, _COPY_BATCH_SIZE))
 
     new_dataset = rg.Dataset(
         name=target_name,
@@ -424,21 +433,23 @@ def copy(
         client=client,
     ).create()
 
-    if records:
+    count = 0
+    try:
+        while batch:
+            new_dataset.records.log(batch)
+            count += len(batch)
+            batch = list(islice(stream, _COPY_BATCH_SIZE))
+    except Exception:
+        # The dataset exists but is empty or partial. Remove it rather than
+        # leave an artifact that makes retrying the same name fail.
         try:
-            new_dataset.records.log(records)
-        except Exception:
-            # The dataset exists but is empty or partial. Remove it rather
-            # than leave an artifact that makes retrying the same name fail.
-            try:
-                new_dataset.delete()
-            except Exception:  # noqa: BLE001 - rollback is best-effort
-                print_warn(
-                    f"Could not remove the partially copied dataset "
-                    f"'{target_name}'; delete it before retrying."
-                )
-            raise
-    count = len(records)
+            new_dataset.delete()
+        except Exception:  # noqa: BLE001 - rollback is best-effort
+            print_warn(
+                f"Could not remove the partially copied dataset "
+                f"'{target_name}'; delete it before retrying."
+            )
+        raise
 
     print_ok(f"Copied '{name}' to '{target_name}' in workspace '{destination}'")
     render(

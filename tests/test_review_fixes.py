@@ -1266,3 +1266,142 @@ def test_every_http_status_maps_to_a_documented_code(
     mapped = map_exception(_ApiError(f"http {status_code}", status_code))
 
     assert mapped.exit_code == expected_exit, f"{status_code} -> {mapped.exit_code}"
+
+
+# ---------------------------------------------------------------------------
+# Tenth review round
+# ---------------------------------------------------------------------------
+
+
+def test_copy_streams_records_in_batches(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`copy --with-records` must not hold the whole source in memory.
+
+    Verified by observing the *sizes* of the log() calls: a single call
+    carrying every record means the source was materialised, whatever the
+    final count says.
+    """
+    import argilla
+
+    from argilla_cli.commands.dataset import _COPY_BATCH_SIZE
+
+    total = _COPY_BATCH_SIZE * 2 + 7
+    workspace = FakeWorkspace("nlp-lab")
+    source = FakeDataset("src", "nlp-lab", [])
+    source.records = _StreamingRecords(  # type: ignore[assignment]
+        [{"id": f"r{i}"} for i in range(total)]
+    )
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[source]))
+
+    batch_sizes: list[int] = []
+    created: list[FakeDataset] = []
+
+    def factory(**kwargs: Any) -> Any:
+        dataset = FakeDataset(kwargs.get("name", "copy"), "nlp-lab", [])
+        original_log = dataset.records.log
+
+        def counting_log(records: list[dict[str, Any]]) -> None:
+            batch_sizes.append(len(records))
+            original_log(records)
+
+        dataset.records.log = counting_log  # type: ignore[assignment]
+
+        class _Wrapper:
+            def create(self) -> FakeDataset:
+                created.append(dataset)
+                return dataset
+
+        return _Wrapper()
+
+    monkeypatch.setattr(argilla, "Dataset", factory)
+
+    result = runner.invoke(app, ["dataset", "copy", "src", "src-copy", "-w", "nlp-lab"])
+
+    assert result.exit_code == 0, result.output
+    assert sum(batch_sizes) == total, "every record should still be copied"
+    assert len(batch_sizes) == 3, f"expected batched uploads, got {batch_sizes}"
+    assert max(batch_sizes) <= _COPY_BATCH_SIZE
+    assert len(created[0].records.logged) == total
+
+
+def test_copy_reads_the_first_batch_before_creating(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable source still creates nothing, despite the streaming.
+
+    This is the property from the earlier rollback fix, and batching must not
+    cost it: the first batch is read before the destination exists.
+    """
+    import argilla
+
+    workspace = FakeWorkspace("nlp-lab")
+    source = FakeDataset("src", "nlp-lab", [])
+    source.records = _FailingRecords(  # type: ignore[assignment]
+        _ApiError("source unreadable", 503)
+    )
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[source]))
+
+    created: list[Any] = []
+
+    def factory(**kwargs: Any) -> Any:
+        class _Wrapper:
+            def create(self) -> FakeDataset:
+                created.append(kwargs)
+                return FakeDataset("src-copy", "nlp-lab", [])
+
+        return _Wrapper()
+
+    monkeypatch.setattr(argilla, "Dataset", factory)
+
+    result = runner.invoke(app, ["dataset", "copy", "src", "src-copy", "-w", "nlp-lab"])
+
+    assert result.exit_code == 11, result.output
+    assert created == [], "nothing should have been created"
+
+
+def test_copy_rolls_back_when_a_later_batch_fails(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure after the first batch still removes the destination.
+
+    Batching widens the window in which the destination exists but is
+    incomplete, so the rollback has to cover a mid-copy failure too.
+    """
+    import argilla
+
+    from argilla_cli.commands.dataset import _COPY_BATCH_SIZE
+
+    workspace = FakeWorkspace("nlp-lab")
+    source = FakeDataset("src", "nlp-lab", [])
+    source.records = _StreamingRecords(  # type: ignore[assignment]
+        [{"id": f"r{i}"} for i in range(_COPY_BATCH_SIZE * 2)]
+    )
+    _use_client(monkeypatch, FakeArgilla(workspaces=[workspace], datasets=[source]))
+
+    created: list[FakeDataset] = []
+
+    def factory(**kwargs: Any) -> Any:
+        dataset = FakeDataset(kwargs.get("name", "copy"), "nlp-lab", [])
+        calls = {"n": 0}
+
+        def failing_log(records: list[dict[str, Any]]) -> None:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise _ApiError("bulk upsert rejected mid-copy", 422)
+
+        dataset.records.log = failing_log  # type: ignore[assignment]
+
+        class _Wrapper:
+            def create(self) -> FakeDataset:
+                created.append(dataset)
+                return dataset
+
+        return _Wrapper()
+
+    monkeypatch.setattr(argilla, "Dataset", factory)
+
+    result = runner.invoke(app, ["dataset", "copy", "src", "src-copy", "-w", "nlp-lab"])
+
+    assert result.exit_code == 13, result.output
+    assert created[0].deleted is True, "destination should have been rolled back"
