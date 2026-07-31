@@ -1545,7 +1545,7 @@ def test_saving_a_profile_leaves_the_old_config_intact_on_failure(
     opens the file, so a full disk or a Ctrl+C left invalid TOML behind --
     which `load_store` then rejects, failing every later command too.
     """
-    import argilla_cli.atomic_io as atomic_io
+    import argilla_cli.file_io as atomic_io
     from argilla_cli.profiles import ProfileStore, load_store, save_store
 
     config = tmp_path / "config.toml"
@@ -1591,7 +1591,7 @@ def test_saved_config_is_never_briefly_world_readable(
     world-readable file. So the check is made against the file actually
     holding the payload, at the moment it is put into place.
     """
-    import argilla_cli.atomic_io as atomic_io
+    import argilla_cli.file_io as atomic_io
     from argilla_cli.profiles import ProfileStore, save_store
 
     real_replace = atomic_io.os.replace
@@ -1866,7 +1866,7 @@ def test_settings_export_is_atomic(
     runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An interrupted export leaves no truncated settings file behind."""
-    import argilla_cli.atomic_io as atomic_io
+    import argilla_cli.file_io as atomic_io
 
     def boom(src: Any, dst: Any) -> None:
         raise OSError("No space left on device")
@@ -1944,3 +1944,80 @@ def test_server_info_still_reports_a_lone_missing_endpoint() -> None:
         server_info(_Client())
 
     assert map_exception(excinfo.value).exit_code == 12
+
+
+# --------------------------------------------------------------------------
+# Round fifteen
+# --------------------------------------------------------------------------
+
+
+def test_mapping_file_with_bad_bytes_is_a_validation_error(tmp_path: Path) -> None:
+    """A `--map` file that is not valid UTF-8 exits 13, not 1.
+
+    `Path.read_text` raises `UnicodeDecodeError`, which is a `ValueError` --
+    so it is not caught by a `json.JSONDecodeError` clause and is not
+    recognised by `map_exception` either.
+    """
+    from argilla_cli.errors import ValidationError
+    from argilla_cli.records_io import load_mapping
+
+    mapping = tmp_path / "m.json"
+    mapping.write_bytes(b'{"text": "\xff\xfe"}')
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_mapping(mapping)
+
+    assert excinfo.value.exit_code == 13
+    assert "not valid UTF-8" in str(excinfo.value)
+
+
+def test_config_file_with_bad_bytes_is_a_validation_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same defect in the config loader, which no review reported.
+
+    `except (OSError, TOMLDecodeError)` reads as exhaustive but is not:
+    `UnicodeDecodeError` derives from `ValueError`, so it escaped both
+    clauses. This one is worse than the mapping case, because every command
+    loads the config -- so a single bad byte made the whole CLI exit 1 with
+    an unexplained error.
+    """
+    from argilla_cli.errors import ValidationError
+    from argilla_cli.profiles import load_store
+
+    config = tmp_path / "config.toml"
+    config.write_bytes(b'current = "\xff\xfe"\n')
+    monkeypatch.setenv("ARGILLA_CLI_CONFIG", str(config))
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_store()
+
+    assert excinfo.value.exit_code == 13
+    assert "not valid UTF-8" in str(excinfo.value)
+
+
+def test_a_corrupt_config_does_not_crash_the_whole_cli(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: `config show` reports the problem rather than exiting 1."""
+    config = tmp_path / "config.toml"
+    config.write_bytes(b'current = "\xff\xfe"\n')
+    monkeypatch.setenv("ARGILLA_CLI_CONFIG", str(config))
+
+    result = runner.invoke(app, ["config", "show"])
+
+    assert result.exit_code == 13, result.output
+
+
+def test_download_with_an_undecodable_mapping_exits_13(
+    runner: CliRunner, credentials: None
+) -> None:
+    """And through the command that actually takes `--map`."""
+    Path("m.json").write_bytes(b'{"text": "\xff\xfe"}')
+
+    result = runner.invoke(
+        app,
+        ["dataset", "download", "reviews", "-w", "nlp-lab", "--map", "m.json"],
+    )
+
+    assert result.exit_code == 13, result.output

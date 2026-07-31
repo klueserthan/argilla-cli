@@ -10,7 +10,6 @@ from typing import Annotated, Any
 
 import typer
 
-from argilla_cli.atomic_io import atomic_path
 from argilla_cli.context import ctx
 from argilla_cli.errors import (
     MissingExtraError,
@@ -18,6 +17,7 @@ from argilla_cli.errors import (
     handle_errors,
     is_classified,
 )
+from argilla_cli.file_io import atomic_path
 from argilla_cli.io_utils import print_ok, print_warn, render
 from argilla_cli.options import LimitOpt, WorkspaceOpt, confirm, resolve_workspace_name
 from argilla_cli.records_io import (

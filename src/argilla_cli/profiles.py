@@ -25,8 +25,8 @@ from typing import Any
 
 import tomli_w
 
-from argilla_cli.atomic_io import atomic_path
 from argilla_cli.errors import NotFoundError, ValidationError
+from argilla_cli.file_io import atomic_path, read_text_file
 
 #: Keys a profile is allowed to hold, mapped to the env var they stand in for.
 PROFILE_KEYS: dict[str, str] = {
@@ -95,9 +95,14 @@ def load_store() -> ProfileStore:
     if not path.is_file():
         return ProfileStore(path=path, exists=False)
 
+    # `except (OSError, TOMLDecodeError)` looks exhaustive and is not:
+    # `UnicodeDecodeError` derives from `ValueError`, so a config file with a
+    # bad byte escaped both clauses and exited 1 -- from every command, since
+    # they all load this. The shared reader handles decoding and I/O.
+    text = read_text_file(path, f"config file {path}")
     try:
-        raw: dict[str, Any] = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raw: dict[str, Any] = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
         raise ValidationError(f"failed to read config file {path}: {exc}") from exc
 
     profiles_raw = raw.get("profiles", {})

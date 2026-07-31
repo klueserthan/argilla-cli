@@ -17,8 +17,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
-from argilla_cli.atomic_io import atomic_path
 from argilla_cli.errors import MissingExtraError, ValidationError, is_classified
+from argilla_cli.file_io import atomic_path, read_text_file
 
 
 class RecordFormat(StrEnum):
@@ -90,8 +90,11 @@ def load_mapping(path: Path) -> dict[str, str]:
     if path.suffix.lower() != ".json":
         raise ValidationError(f"unsupported mapping format {path.suffix!r}; use .json")
 
+    # Decoding goes through the shared reader: `UnicodeDecodeError` is a
+    # `ValueError`, so it slips past a `json.JSONDecodeError` clause and past
+    # `map_exception`, and a mapping file with one bad byte exited 1.
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_text_file(path, f"mapping file {path}"))
     except json.JSONDecodeError as exc:
         raise ValidationError(f"failed to parse mapping file {path}: {exc}") from exc
 
