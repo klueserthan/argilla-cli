@@ -12,6 +12,7 @@ import csv
 import json
 import tempfile
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from enum import StrEnum
 from itertools import islice
 from pathlib import Path
@@ -655,9 +656,67 @@ def read_records(
     return list(iter_records(path, fmt, limit))
 
 
+@contextmanager
+def spooled_records(
+    rows: Iterable[dict[str, Any]],
+) -> Iterator[tuple[int, Iterator[dict[str, Any]]]]:
+    """Consume a record stream to disk, then hand back a count and a replay.
+
+    Lets a caller check an entire input before acting on any of it without
+    holding the input in memory -- the two properties `dataset push` needs at
+    once. Reading it lazily and uploading as it went made a malformed record
+    at row 600 leave the first 500 already on the server; reading it eagerly
+    into a list restored that guarantee but reintroduced the memory cost.
+
+    Everything that can fail locally -- parsing, decoding, JMESPath mapping
+    -- happens while filling the spool, so the caller reaches the first
+    upload only once the whole input is known to be good.
+
+    The temporary file is unlinked at once on POSIX, so it never appears in
+    the filesystem, and is removed on the way out either way.
+    """
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as spool:
+        count = 0
+        for row in rows:
+            spool.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+            count += 1
+        spool.seek(0)
+        yield count, (json.loads(line) for line in spool)
+
+
+def _to_native(value: Any) -> Any:
+    """Convert NumPy and Arrow values into plain Python ones.
+
+    A native Parquet list column comes back from pandas as an ``ndarray``,
+    not a ``list``. That is not a cosmetic difference: JMESPath does not
+    recognise an ``ndarray`` as a JSON array, so ``labels[0]`` in a ``--map``
+    file evaluates to ``None`` -- silently producing an empty field rather
+    than failing -- and ``json.dumps`` refuses the value outright when it
+    reaches the API.
+
+    Duck-typed on ``tolist`` rather than importing NumPy, which is an
+    optional dependency here and must not be required to read a record.
+    ``tolist`` also converts NumPy *scalars* (``int64``, ``float64``) to
+    Python ones, and does so recursively, which matters because these
+    records go on to be serialised.
+    """
+    if isinstance(value, str | bytes):
+        return value
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        value = tolist()
+    if isinstance(value, dict):
+        return {k: _to_native(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_native(v) for v in value]
+    return value
+
+
 def _restore_row(row: dict[str, Any]) -> dict[str, Any]:
     """Rebuild one record from a tabular row."""
-    return {k: _unscalarize(v) for k, v in row.items() if not _is_missing(v)}
+    return {
+        k: _unscalarize(_to_native(v)) for k, v in row.items() if not _is_missing(v)
+    }
 
 
 def resolve_target_path(

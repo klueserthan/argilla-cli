@@ -2021,3 +2021,166 @@ def test_download_with_an_undecodable_mapping_exits_13(
     )
 
     assert result.exit_code == 13, result.output
+
+
+# --------------------------------------------------------------------------
+# Round sixteen
+# --------------------------------------------------------------------------
+
+
+def test_native_parquet_lists_come_back_as_lists(tmp_path: Path) -> None:
+    """A native Parquet list column must not stay a NumPy array.
+
+    pandas returns `ndarray` for such a column. JMESPath does not recognise
+    it as a JSON array, so a `--map` expression like `labels[0]` evaluated to
+    `None` -- an empty field rather than an error -- and `json.dumps` refuses
+    the value outright on the way to the API.
+    """
+    pd = pytest.importorskip("pandas")
+    import jmespath
+
+    path = tmp_path / "native.parquet"
+    pd.DataFrame({"id": ["r1"], "labels": [["a", "b"]]}).to_parquet(path, index=False)
+
+    record = read_records(path, RecordFormat.PARQUET)[0]
+
+    assert isinstance(record["labels"], list), type(record["labels"]).__name__
+    assert record["labels"] == ["a", "b"]
+    # The two things the ndarray actually broke:
+    assert jmespath.compile("labels[0]").search(record) == "a"
+    assert json.loads(json.dumps(record))["labels"] == ["a", "b"]
+
+
+def test_native_parquet_scalars_are_python_scalars(tmp_path: Path) -> None:
+    """Scalars stay serialisable through the array conversion.
+
+    A guard, not a regression: pandas already hands back Python `int`/`float`
+    from `to_dict(orient="records")`, so this passed before the fix too. It
+    is here because `_to_native` is duck-typed on `tolist`, which NumPy
+    scalars also have -- so a careless version of that conversion could
+    break the values that were never broken.
+    """
+    pd = pytest.importorskip("pandas")
+
+    path = tmp_path / "scalars.parquet"
+    pd.DataFrame({"id": ["r1"], "score": [3], "ratio": [0.5]}).to_parquet(
+        path, index=False
+    )
+
+    record = read_records(path, RecordFormat.PARQUET)[0]
+
+    assert json.dumps(record)  # would raise on numpy types
+    assert record["score"] == 3
+    assert record["ratio"] == 0.5
+
+
+def test_push_uploads_nothing_when_a_later_record_is_malformed(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla, monkeypatch: Any
+) -> None:
+    """A parse failure after the first batch must leave the server untouched.
+
+    Streaming the input straight into batched uploads meant a bad record at
+    row 600 left the first 500 already logged. That is worse than it sounds
+    for `push` specifically: it deliberately keeps record ids so re-uploading
+    can *update* records, so retrying an input without ids duplicated the
+    partial rows instead of correcting them.
+
+    The whole input is now parsed and mapped into a disk spool before the
+    first upload, so local failures are caught while nothing is committed.
+    """
+    from argilla_cli.commands import dataset as dataset_cmd
+
+    monkeypatch.setattr(dataset_cmd, "_PUSH_BATCH_SIZE", 10)
+
+    Path("many.jsonl").write_text(
+        "\n".join(json.dumps({"id": f"r{i}"}) for i in range(25))
+        + "\n{ this line is not valid json\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "many.jsonl"]
+    )
+
+    assert result.exit_code == 13, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    assert intents.records.logged == [], (
+        f"{len(intents.records.logged)} record(s) were uploaded before the failure"
+    )
+
+
+def test_push_uploads_nothing_when_a_later_mapping_fails(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla, monkeypatch: Any
+) -> None:
+    """The same guarantee for a `--map` expression that fails mid-stream."""
+    from argilla_cli.commands import dataset as dataset_cmd
+
+    monkeypatch.setattr(dataset_cmd, "_PUSH_BATCH_SIZE", 10)
+
+    # Only the *last* row maps to a list, so the failure lands after several
+    # batches would already have been uploaded. An earlier version of this
+    # test gave every row a list, which failed on row 0 and so passed against
+    # the unfixed source -- proving nothing.
+    rows: list[dict[str, Any]] = [{"id": f"r{i}", "labels": "x"} for i in range(25)]
+    rows.append({"id": "r25", "labels": ["a", "b"]})  # a list, under `error`
+    Path("m.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+    Path("map.json").write_text(json.dumps({"label": "labels"}), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "push",
+            "intents",
+            "-w",
+            "nlp-lab",
+            "--from",
+            "m.jsonl",
+            "--map",
+            "map.json",
+            "--list-policy",
+            "error",
+        ],
+    )
+
+    assert result.exit_code == 13, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    assert intents.records.logged == []
+
+
+def test_push_still_uploads_in_bounded_batches_from_the_spool(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla, monkeypatch: Any
+) -> None:
+    """Validating up front must not put the whole input back in memory.
+
+    The spool exists so `push` can keep both properties at once; this pins
+    that uploads still leave the spool a batch at a time.
+    """
+    from argilla_cli.commands import dataset as dataset_cmd
+
+    monkeypatch.setattr(dataset_cmd, "_PUSH_BATCH_SIZE", 10)
+
+    Path("many.jsonl").write_text(
+        "\n".join(json.dumps({"id": f"r{i}"}) for i in range(25)) + "\n",
+        encoding="utf-8",
+    )
+
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    batches: list[int] = []
+    real_log = intents.records.log
+
+    def counting_log(records: list[dict[str, Any]]) -> None:
+        batches.append(len(records))
+        real_log(records)
+
+    intents.records.log = counting_log  # type: ignore[assignment]
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "many.jsonl"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert batches == [10, 10, 5], f"expected bounded batches, got {batches}"
+    assert len(intents.records.logged) == 25

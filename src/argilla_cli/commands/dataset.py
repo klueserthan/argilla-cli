@@ -30,6 +30,7 @@ from argilla_cli.records_io import (
     iter_records,
     load_mapping,
     resolve_target_path,
+    spooled_records,
     strip_server_ids,
     transform_record,
     write_records,
@@ -392,16 +393,22 @@ def push(
     """
     dataset = resolve_dataset(ctx.client(), name, resolve_workspace_name(workspace))
 
-    # Records are read, mapped and uploaded in batches, so the file never has
-    # to fit in memory. The limit is passed down rather than applied
-    # afterwards, so a large file is not parsed in full to upload the first
-    # few records, and `--map` transforms one batch at a time instead of
-    # building a second full list beside the first.
+    # The whole input is parsed and mapped *before* anything is uploaded, and
+    # spooled to disk rather than held in memory so a large file still costs
+    # only one batch of RAM.
     #
-    # Batching here does not make a partial upload newly possible: the SDK's
-    # `log()` already chunks its argument (batch_size=256) and issues a
-    # request per chunk, so a failure part-way through always left the
-    # earlier records in place. What changes is only how much the CLI holds.
+    # Both halves of that matter, and an earlier version had only one. Reading
+    # lazily and uploading as it went meant a malformed record at row 600 left
+    # the first 500 already on the server -- and since `push` deliberately
+    # keeps ids so re-uploading can update records, retrying an input *without*
+    # ids then duplicated them. Reading eagerly into a list fixed that but put
+    # the whole file back in memory. Spooling gives both.
+    #
+    # This is only about failures the CLI can see coming: parse errors, bad
+    # UTF-8, a JMESPath mapping that blows up. A network failure part-way
+    # through an upload still leaves earlier records in place, because
+    # `records.log()` chunks internally (batch_size=256) and issues a request
+    # per chunk -- there is no transaction to roll back, and never was.
     stream: Iterator[dict[str, Any]] = iter_records(
         source, infer_format(source, fmt), limit
     )
@@ -411,17 +418,12 @@ def push(
             transform_record(row, compiled, list_policy, list_sep) for row in stream
         )
 
-    # Read the first batch before logging anything, so an empty file is
-    # reported without a pointless round-trip to the server.
-    batch = list(islice(stream, _PUSH_BATCH_SIZE))
-    if not batch:
-        raise ValidationError(f"no records found in {source}")
+    with spooled_records(stream) as (count, validated):
+        if not count:
+            raise ValidationError(f"no records found in {source}")
 
-    count = 0
-    while batch:
-        dataset.records.log(batch)
-        count += len(batch)
-        batch = list(islice(stream, _PUSH_BATCH_SIZE))
+        while batch := list(islice(validated, _PUSH_BATCH_SIZE)):
+            dataset.records.log(batch)
 
     print_ok(f"Pushed {count} record(s) to '{name}'")
     render({"dataset": name, "records": count, "source": str(source)})
