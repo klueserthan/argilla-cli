@@ -196,3 +196,42 @@ def test_ingestion_hook_is_available_for_the_early_shape_check() -> None:
     from argilla.records._dataset_records import DatasetRecords
 
     assert callable(getattr(DatasetRecords, "_ingest_records", None))
+
+
+def test_workspace_membership_takes_a_user_or_a_username() -> None:
+    """`workspace add-user`/`remove-user` hand the SDK a `User` resource.
+
+    Review twice reported that these should pass `user.id` instead. They
+    should not, and the accessor is explicit about why: it branches on
+    `isinstance(user, str)` to mean *username*, and otherwise calls a method
+    on the object. A `UUID` is neither, so passing `user.id` would reach the
+    `else` branch and fail on a type with no such method.
+
+    Pinned here because the fake client's `add_user(user: FakeUser)` would
+    look identical whichever the SDK actually wanted.
+    """
+    from argilla.workspaces._resource import Workspace, WorkspaceUsers
+
+    for name in ("add_user", "remove_user"):
+        annotation = str(inspect.signature(getattr(Workspace, name)).parameters["user"])
+        assert "User" in annotation and "str" in annotation, annotation
+
+    for name, delegate in (
+        ("add", "add_to_workspace"),
+        ("delete", "remove_from_workspace"),
+    ):
+        source = inspect.getsource(getattr(WorkspaceUsers, name))
+        assert "isinstance(user, str)" in source, source
+        assert delegate in source, source
+
+
+def test_workspace_has_no_delete_user_method() -> None:
+    """The suggested `workspace.delete_user(user.id)` does not exist.
+
+    Kept as a test rather than a reply so the refutation is checked against
+    the SDK on every run instead of resting on one reading of it.
+    """
+    from argilla.workspaces._resource import Workspace
+
+    assert not hasattr(Workspace, "delete_user")
+    assert callable(getattr(Workspace, "remove_user", None))

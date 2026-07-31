@@ -387,7 +387,23 @@ def _is_missing(value: Any) -> bool:
         return True
     if isinstance(value, float):
         return value != value  # NaN
+    if type(value).__name__ in _MISSING_SENTINELS:
+        return True
     return isinstance(value, str) and value == ""
+
+
+#: pandas' own "no value here" singletons, matched by type name so that
+#: neither pandas nor NumPy has to be imported to read a record -- they are
+#: optional dependencies, reachable only through the ``export`` extra.
+#:
+#: Identified by name rather than compared, deliberately. ``pd.NA != pd.NA``
+#: evaluates to ``pd.NA``, whose truth value *raises*, so the NaN trick above
+#: cannot be extended to cover it. A nullable Parquet column yields these for
+#: an empty cell, and neither is ``None``, a ``float`` or a ``str`` -- so
+#: they survived as real values and the JSON spool's ``default=str`` turned
+#: them into the literal strings ``"<NA>"`` and ``"NaT"``, sending an absent
+#: property to Argilla as user data.
+_MISSING_SENTINELS = frozenset({"NAType", "NaTType"})
 
 
 def _unscalarize(value: Any) -> Any:

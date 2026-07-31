@@ -2324,3 +2324,71 @@ def test_push_works_when_the_sdk_has_no_ingestion_hook(
     assert result.exit_code == 0, result.output
     intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
     assert len(intents.records.logged) == 5
+
+
+# --------------------------------------------------------------------------
+# Round eighteen
+# --------------------------------------------------------------------------
+
+
+def test_pandas_missing_sentinels_count_as_absent() -> None:
+    """`pd.NA` and `NaT` are absent values, not data.
+
+    Neither is `None`, a `float`, or a `str`, so both survived the
+    missing-cell check. The JSON spool then ran them through `default=str`
+    and sent Argilla the literal strings `"<NA>"` and `"NaT"` for a property
+    the record simply did not have.
+
+    They are matched by type name rather than compared: `pd.NA != pd.NA`
+    evaluates to `pd.NA`, whose truth value *raises*, so the NaN trick used
+    for floats cannot be extended to cover it.
+    """
+    pd = pytest.importorskip("pandas")
+    from argilla_cli.records_io import _is_missing
+
+    assert _is_missing(pd.NA) is True
+    assert _is_missing(pd.NaT) is True
+    # ...and the existing cases still behave.
+    assert _is_missing(None) is True
+    assert _is_missing(float("nan")) is True
+    assert _is_missing("") is True
+    assert _is_missing(0) is False
+    assert _is_missing("text") is False
+
+
+def test_missing_check_never_truth_tests_an_array() -> None:
+    """The array-safety property survives the new sentinel branch.
+
+    A native Parquet list column yields an ndarray, and `array == ""`
+    returns an array whose truth value raises. The check must reach a
+    verdict without ever comparing the value itself.
+    """
+    np = pytest.importorskip("numpy")
+    from argilla_cli.records_io import _is_missing
+
+    assert _is_missing(np.array(["a", "b"])) is False
+    assert _is_missing(np.array([])) is False
+
+
+def test_nullable_parquet_columns_drop_their_empty_cells(tmp_path: Path) -> None:
+    """End to end: an empty nullable cell does not become `"NaT"`."""
+    pd = pytest.importorskip("pandas")
+
+    path = tmp_path / "nullable.parquet"
+    pd.DataFrame(
+        {
+            "id": ["r1", "r2"],
+            "seen": pd.array(
+                [pd.Timestamp("2020-01-01"), None], dtype="datetime64[ns]"
+            ),
+        }
+    ).to_parquet(path, index=False)
+
+    records = read_records(path, RecordFormat.PARQUET)
+
+    assert "seen" not in records[1], records[1]
+    assert records[1] == {"id": "r2"}
+    # The value that *is* present survives.
+    assert "seen" in records[0]
+    # And nothing stringly-typed leaks into the upload payload.
+    assert "NaT" not in json.dumps(records, default=str)
