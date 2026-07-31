@@ -105,7 +105,16 @@ def server_info(client: Any) -> dict[str, Any]:
         try:
             response = http.get(path)
             response.raise_for_status()
-            payload = response.json()
+            try:
+                payload = response.json()
+            except Exception as exc:
+                # A 200 whose body is not JSON means something answered that
+                # is not the Argilla API -- typically a proxy serving an HTML
+                # login or error page. The decode error itself comes from the
+                # `json` module, which the classifier has no reason to know,
+                # so it reached the unclassified exit 1. A server that
+                # responds with nonsense is a server problem: 11.
+                raise NetworkApiError(f"{path} did not return JSON: {exc}") from exc
         except Exception as exc:
             # Endpoints are probed opportunistically -- one may be absent on
             # older servers -- but the failures are kept so that a total

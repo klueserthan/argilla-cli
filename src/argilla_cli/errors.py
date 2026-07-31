@@ -90,13 +90,20 @@ def _status_code_of(exc: BaseException) -> int | None:
     return None
 
 
-def _map_status(status: int, message: str) -> CLIError:
-    """Map an HTTP status onto the documented exit codes.
+def _map_status(status: int, message: str) -> CLIError | None:
+    """Map an HTTP status onto the documented exit codes, or ``None``.
 
-    Every status is assigned, deliberately. Listing only the familiar few
-    left 408, 413 and 429 falling through to the unclassified exit 1 -- a
-    rate-limited request reported as "unexpected error" rather than as
-    something to retry.
+    Every status from 300 up is assigned, deliberately. Listing only the
+    familiar few left 408, 413 and 429 falling through to the unclassified
+    exit 1 -- a rate-limited request reported as "unexpected error" rather
+    than as something to retry.
+
+    Returning ``None`` rather than a bare ``CLIError`` matters: it lets the
+    caller keep looking. An httpx error carrying a status this cannot
+    classify used to be *worse* off than the same error carrying none at
+    all, because the status branch short-circuited the transport rules below
+    it -- so a redirect loop reported exit 1 while an identical failure
+    without a response reported 11.
     """
     if status in (401, 403):
         return AuthConfigError(message)
@@ -109,7 +116,12 @@ def _map_status(status: int, message: str) -> CLIError:
     if 400 <= status < 500:
         # Any other 4xx means the server rejected what we sent.
         return ValidationError(message)
-    return CLIError(message)
+    if 300 <= status < 400:
+        # A redirect that surfaced as an error means the request never
+        # completed -- a misconfigured proxy or a redirect loop. That is an
+        # availability problem, not something the caller sent wrong.
+        return NetworkApiError(message)
+    return None
 
 
 def map_exception(exc: BaseException) -> CLIError:
@@ -127,7 +139,11 @@ def map_exception(exc: BaseException) -> CLIError:
 
     status = _status_code_of(exc)
     if status is not None:
-        return _map_status(status, message)
+        mapped = _map_status(status, message)
+        if mapped is not None:
+            return mapped
+        # An unclassifiable status is not a verdict. Fall through, so the
+        # transport and library rules below still get their say.
 
     # Transport-level failures, without importing httpx/requests eagerly.
     module = type(exc).__module__.split(".")[0]

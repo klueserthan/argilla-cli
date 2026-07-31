@@ -2392,3 +2392,103 @@ def test_nullable_parquet_columns_drop_their_empty_cells(tmp_path: Path) -> None
     assert "seen" in records[0]
     # And nothing stringly-typed leaks into the upload payload.
     assert "NaT" not in json.dumps(records, default=str)
+
+
+# --------------------------------------------------------------------------
+# Round nineteen
+# --------------------------------------------------------------------------
+
+
+class _StatusError(Exception):
+    """An exception carrying an HTTP status, as SDK/transport errors do."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize("status", [300, 301, 302, 307, 308, 399])
+def test_redirect_statuses_are_network_failures(status: int) -> None:
+    """A redirect surfacing as an error means the request never completed.
+
+    `_map_status` claimed every status was assigned, and 3xx was not: it
+    fell through to the unclassified exit 1 for what is a misconfigured
+    proxy or a redirect loop.
+    """
+    from argilla_cli.errors import NetworkApiError
+
+    mapped = map_exception(_StatusError(status))
+
+    assert isinstance(mapped, NetworkApiError)
+    assert mapped.exit_code == 11
+
+
+def test_an_unclassifiable_status_does_not_veto_the_transport_rule() -> None:
+    """A status the mapper cannot place must not make things *worse*.
+
+    The status branch returned `CLIError` and short-circuited, so an httpx
+    error carrying a status nobody could classify came out as exit 1 --
+    while the identical error carrying no response at all was correctly
+    classified as a network failure by the module rule further down.
+    Knowing more about a failure should never degrade its classification.
+    """
+    import httpx
+
+    from argilla_cli.errors import NetworkApiError
+
+    class _Response:
+        status_code = 204  # a success code, on an exception: unclassifiable
+
+    with_status = httpx.HTTPError("boom")
+    with_status.response = _Response()  # type: ignore[attr-defined]
+    without_status = httpx.HTTPError("boom")
+
+    assert isinstance(map_exception(without_status), NetworkApiError)
+    assert isinstance(map_exception(with_status), NetworkApiError)
+    assert (
+        map_exception(with_status).exit_code == map_exception(without_status).exit_code
+    )
+
+
+def test_a_status_nobody_can_classify_still_falls_back() -> None:
+    """Falling through must not silently classify everything as a network
+    error -- an exception from nowhere in particular is still exit 1."""
+    from argilla_cli.errors import CLIError
+
+    mapped = map_exception(_StatusError(204))
+
+    assert type(mapped) is CLIError
+    assert mapped.exit_code == 1
+
+
+def test_server_info_reports_a_non_json_body_as_a_server_failure() -> None:
+    """A 200 carrying an HTML login page is a server problem, not exit 1.
+
+    `response.json()` raises out of the `json` module, which the classifier
+    has no reason to recognise, so a proxy answering in place of Argilla
+    produced an unexplained generic failure.
+    """
+    from argilla_cli.clients.argilla_client import server_info
+    from argilla_cli.errors import NetworkApiError
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Any:
+            raise json.JSONDecodeError("Expecting value", "<html>login</html>", 0)
+
+    class _Client:
+        def __init__(self) -> None:
+            self.http_client = self
+
+        def get(self, path: str) -> Any:
+            return _Response()
+
+    with pytest.raises(NetworkApiError) as excinfo:
+        server_info(_Client())
+
+    assert excinfo.value.exit_code == 11
+    assert "did not return JSON" in str(excinfo.value)
