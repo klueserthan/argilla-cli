@@ -2184,3 +2184,143 @@ def test_push_still_uploads_in_bounded_batches_from_the_spool(
     assert result.exit_code == 0, result.output
     assert batches == [10, 10, 5], f"expected bounded batches, got {batches}"
     assert len(intents.records.logged) == 25
+
+
+# --------------------------------------------------------------------------
+# Round seventeen
+# --------------------------------------------------------------------------
+
+
+def test_jmespath_runtime_failure_is_a_validation_error() -> None:
+    """A mapping that compiles but fails on a record exits 13, not 1.
+
+    `length(value)` is valid JMESPath and raises `JMESPathTypeError` when
+    `value` is a number. That lives in `jmespath.exceptions`, which
+    `map_exception` does not recognise, so a mismatch between the user's
+    mapping and the user's data escaped as the unclassified exit code.
+    """
+    from argilla_cli.errors import ValidationError
+    from argilla_cli.records_io import compile_mapping, transform_record
+
+    compiled = compile_mapping({"n": "length(value)"})
+
+    with pytest.raises(ValidationError) as excinfo:
+        transform_record({"value": 42}, compiled)
+
+    assert excinfo.value.exit_code == 13
+    assert "'n'" in str(excinfo.value)
+
+
+def test_download_with_a_failing_mapping_exits_13(
+    runner: CliRunner, credentials: None
+) -> None:
+    """End to end, through the command that takes `--map`."""
+    # `sum` needs an array of numbers; `id` is a string. Valid JMESPath,
+    # wrong for this data -- which is exactly the case that exited 1.
+    Path("m.json").write_text(json.dumps({"n": "sum(id)"}), encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["dataset", "download", "reviews", "-w", "nlp-lab", "--map", "m.json"]
+    )
+
+    assert result.exit_code == 13, result.output
+
+
+class _ShapeCheckingRecords:
+    """A records accessor that rejects a record's shape the way the SDK does.
+
+    Mirrors `DatasetRecords._ingest_records`: a local, per-record check that
+    runs over the whole argument before any upload. The fake client does not
+    have one, so without this the CLI's early-validation pass would be
+    exercised only in the degraded "SDK has no such hook" branch.
+    """
+
+    def __init__(self, bad_id: str) -> None:
+        self.bad_id = bad_id
+        self.logged: list[dict[str, Any]] = []
+
+    def _ingest_records(self, records: list[dict[str, Any]]) -> list[Any]:
+        for record in records:
+            if record.get("id") == self.bad_id:
+                raise ValueError(f"cannot ingest record {record.get('id')!r}")
+        return list(records)
+
+    def log(self, records: list[dict[str, Any]]) -> None:
+        self._ingest_records(records)
+        self.logged.extend(records)
+
+
+def test_push_validates_every_record_shape_before_uploading_any(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla, monkeypatch: Any
+) -> None:
+    """A record the SDK rejects after batch one must stop the whole upload.
+
+    `log()` ingests its entire argument before uploading any of it, so the
+    old single eager call validated everything up front. Calling it per batch
+    moved that check: a bad `suggestions` value at row 600 was not seen until
+    its own batch, by which point rows 1-500 were already committed.
+    """
+    from argilla_cli.commands import dataset as dataset_cmd
+
+    monkeypatch.setattr(dataset_cmd, "_PUSH_BATCH_SIZE", 10)
+
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    records = _ShapeCheckingRecords(bad_id="r22")
+    intents.records = records  # type: ignore[assignment]
+
+    Path("many.jsonl").write_text(
+        "\n".join(json.dumps({"id": f"r{i}"}) for i in range(25)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "many.jsonl"]
+    )
+
+    assert result.exit_code != 0, result.output
+    assert records.logged == [], (
+        f"{len(records.logged)} record(s) were uploaded before the bad shape"
+    )
+
+
+def test_push_still_succeeds_when_every_shape_is_accepted(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla, monkeypatch: Any
+) -> None:
+    """The early check must not reject valid input or double-count it."""
+    from argilla_cli.commands import dataset as dataset_cmd
+
+    monkeypatch.setattr(dataset_cmd, "_PUSH_BATCH_SIZE", 10)
+
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    records = _ShapeCheckingRecords(bad_id="nothing-matches")
+    intents.records = records  # type: ignore[assignment]
+
+    Path("many.jsonl").write_text(
+        "\n".join(json.dumps({"id": f"r{i}"}) for i in range(25)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "many.jsonl"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(records.logged) == 25
+
+
+def test_push_works_when_the_sdk_has_no_ingestion_hook(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla
+) -> None:
+    """`_ingest_records` is private, so its absence must degrade, not break."""
+    Path("many.jsonl").write_text(
+        "\n".join(json.dumps({"id": f"r{i}"}) for i in range(5)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "many.jsonl"]
+    )
+
+    assert result.exit_code == 0, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    assert len(intents.records.logged) == 5

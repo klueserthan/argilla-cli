@@ -168,3 +168,31 @@ def test_transport_lookup_finds_either_location() -> None:
     assert _http_transport(Direct()) == "transport"
     assert _http_transport(ViaApi()) == "transport"
     assert _http_transport(Neither()) is None
+
+
+def test_log_validates_every_record_before_uploading_any() -> None:
+    """`push` checks record shapes up front because `log()` does the same.
+
+    `_ingest_records` runs over the whole argument before the chunked upload
+    loop starts, which is why calling `log()` once per batch moved the check
+    later than it used to be. The CLI now runs the same ingestion across the
+    full input first; if this ordering changed, that pass would be either
+    redundant or wrong.
+    """
+    from argilla.records._dataset_records import DatasetRecords
+
+    source = inspect.getsource(DatasetRecords.log)
+    ingest_at = source.index("_ingest_records")
+    upload_at = source.index("bulk_upsert")
+    assert ingest_at < upload_at, "log() no longer validates before uploading"
+
+
+def test_ingestion_hook_is_available_for_the_early_shape_check() -> None:
+    """The private hook `push` borrows to validate before its first upload.
+
+    Private, so the CLI degrades to "no early shape check" if it disappears.
+    This test makes that degradation visible rather than silent.
+    """
+    from argilla.records._dataset_records import DatasetRecords
+
+    assert callable(getattr(DatasetRecords, "_ingest_records", None))

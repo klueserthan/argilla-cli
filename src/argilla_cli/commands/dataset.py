@@ -33,6 +33,7 @@ from argilla_cli.records_io import (
     spooled_records,
     strip_server_ids,
     transform_record,
+    validate_record_shapes,
     write_records,
 )
 from argilla_cli.resources import (
@@ -404,11 +405,18 @@ def push(
     # ids then duplicated them. Reading eagerly into a list fixed that but put
     # the whole file back in memory. Spooling gives both.
     #
-    # This is only about failures the CLI can see coming: parse errors, bad
-    # UTF-8, a JMESPath mapping that blows up. A network failure part-way
-    # through an upload still leaves earlier records in place, because
-    # `records.log()` chunks internally (batch_size=256) and issues a request
-    # per chunk -- there is no transaction to roll back, and never was.
+    # "Everything the CLI can see coming" now includes the SDK's own record
+    # ingestion, not just parsing and mapping. `log()` validates its whole
+    # argument before uploading any of it, so calling it per batch meant a
+    # record Argilla rejects locally -- a malformed `suggestions` value --
+    # surfaced only when its own batch went up, after the earlier ones had
+    # already committed. Running that check across the full stream first
+    # closes the last local gap.
+    #
+    # A network failure part-way through still leaves earlier records in
+    # place: `records.log()` chunks internally (batch_size=256) and issues a
+    # request per chunk, so there is no transaction to roll back, and never
+    # was. That case is unchanged and is not something this can fix.
     stream: Iterator[dict[str, Any]] = iter_records(
         source, infer_format(source, fmt), limit
     )
@@ -417,6 +425,7 @@ def push(
         stream = (
             transform_record(row, compiled, list_policy, list_sep) for row in stream
         )
+    stream = validate_record_shapes(dataset.records, stream, _PUSH_BATCH_SIZE)
 
     with spooled_records(stream) as (count, validated):
         if not count:

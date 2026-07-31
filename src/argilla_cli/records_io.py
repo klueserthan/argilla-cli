@@ -137,7 +137,20 @@ def transform_record(
     """
     out: dict[str, Any] = {}
     for key, expression in compiled.items():
-        value = expression.search(record)
+        # A mapping can compile cleanly and still fail on a given record --
+        # `length(value)` where `value` is a number raises
+        # `JMESPathTypeError`. That lives in `jmespath.exceptions`, which
+        # `map_exception` does not recognise, so it escaped as the
+        # unclassified exit 1 for what is a mismatch between the user's
+        # mapping and the user's data.
+        try:
+            value = expression.search(record)
+        except Exception as exc:
+            if is_classified(exc):
+                raise
+            raise ValidationError(
+                f"mapping for {key!r} failed on a record: {exc}"
+            ) from exc
         if list_policy is ListPolicy.PRESERVE:
             out[key] = value
         elif isinstance(value, list):
@@ -654,6 +667,40 @@ def read_records(
     whole set in hand.
     """
     return list(iter_records(path, fmt, limit))
+
+
+def validate_record_shapes(
+    records: Any, rows: Iterable[dict[str, Any]], batch_size: int
+) -> Iterator[dict[str, Any]]:
+    """Pass rows through the SDK's own record ingestion before yielding them.
+
+    ``log()`` runs ``_ingest_records`` over its whole argument *before*
+    uploading any of it, so a single eager call validated the entire input
+    up front. Calling it once per batch moved that guarantee: a record the
+    SDK rejects locally -- a malformed ``suggestions`` value, say -- would
+    not be seen until its own batch, by which point the earlier batches were
+    already on the server.
+
+    Checking here restores it without giving up the memory bound. Rows are
+    validated a batch at a time and then yielded onward, so the caller
+    (which spools them) reaches its first upload only once *every* row has
+    been accepted. The cost is that ingestion runs twice per record, which
+    is local work only -- no request is made.
+
+    ``_ingest_records`` is private, so its absence degrades to "no early
+    shape check" rather than an error, exactly as the lazy flattener does.
+    ``test_sdk_contract`` fails if it moves, so that degradation is visible.
+    """
+    ingest = getattr(records, "_ingest_records", None)
+    # The iterator is taken once: re-deriving it per batch would restart a
+    # list from the beginning and never terminate.
+    iterator = iter(rows)
+    while batch := list(islice(iterator, batch_size)):
+        if callable(ingest):
+            # RecordsIngestionError is an argilla exception whose name the
+            # error mapper already classifies as a validation failure (13).
+            ingest(batch)
+        yield from batch
 
 
 @contextmanager
