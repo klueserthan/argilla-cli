@@ -10,6 +10,7 @@ from typing import Annotated, Any
 
 import typer
 
+from argilla_cli.atomic_io import atomic_path
 from argilla_cli.context import ctx
 from argilla_cli.errors import (
     MissingExtraError,
@@ -268,14 +269,29 @@ def settings_(
         Path | None,
         typer.Option("--export", help="Write the settings to this JSON file."),
     ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Overwrite an existing export file.")
+    ] = False,
 ) -> None:
     """Show a dataset's settings, or export them for reuse with `create`."""
     dataset = resolve_dataset(ctx.client(), name, resolve_workspace_name(workspace))
     settings = dataset.settings
 
     if export is not None:
-        export.parent.mkdir(parents=True, exist_ok=True)
-        settings.to_json(export)
+        # `--force` and this message mirror `download`, which had them and
+        # this did not. Without it, exporting over an existing file surfaced
+        # the SDK's raw FileExistsError as the unclassified exit 1, with no
+        # way to say "yes, replace it".
+        if export.exists() and not force:
+            raise ValidationError(f"{export} already exists; pass --force to overwrite")
+        # Written to a temporary sibling and moved into place, so an
+        # interrupted export cannot leave a truncated settings file that
+        # `dataset create` would later reject.
+        with atomic_path(export) as tmp_path:
+            # `Settings.to_json` refuses to write to a path that exists, and
+            # `atomic_path` hands over a file it has already created.
+            tmp_path.unlink()
+            settings.to_json(tmp_path)
         print_ok(f"Exported settings to {export}")
         render({"dataset": name, "path": str(export)})
         return

@@ -10,7 +10,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from argilla_cli.errors import NetworkApiError
+from argilla_cli.errors import (
+    AuthConfigError,
+    CLIError,
+    NetworkApiError,
+    NotFoundError,
+    ValidationError,
+    map_exception,
+)
 from argilla_cli.settings import Settings
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -60,6 +67,32 @@ def _http_transport(client: Any) -> Any | None:
     return None
 
 
+#: How informative a probe failure is, lowest first. When every endpoint
+#: fails, the one that best explains *why* is reported.
+#:
+#: A 404 ranks last on purpose: these endpoints are probed speculatively and
+#: may simply not exist on a given server, so "not found" says the least of
+#: any outcome. Reporting whichever failure happened to come last meant a
+#: 401 on `/version` followed by a 404 on `/status` surfaced as exit 12 --
+#: "no such thing" -- when the real answer was "your credentials are wrong".
+_PROBE_ERROR_RANK: dict[type[CLIError], int] = {
+    AuthConfigError: 0,
+    NetworkApiError: 1,
+    ValidationError: 2,
+    CLIError: 3,
+    NotFoundError: 4,
+}
+
+
+def _more_informative(candidate: Exception, incumbent: Exception | None) -> bool:
+    """True when ``candidate`` explains a probe failure better."""
+    if incumbent is None:
+        return True
+    rank = _PROBE_ERROR_RANK.get(type(map_exception(candidate)), 3)
+    current = _PROBE_ERROR_RANK.get(type(map_exception(incumbent)), 3)
+    return rank < current
+
+
 def server_info(client: Any) -> dict[str, Any]:
     """Fetch server version/status via the SDK's underlying HTTP client."""
     http = _http_transport(client)
@@ -67,7 +100,7 @@ def server_info(client: Any) -> dict[str, Any]:
         raise NetworkApiError("client does not expose an HTTP transport")
 
     info: dict[str, Any] = {}
-    last_error: Exception | None = None
+    best_error: Exception | None = None
     for label, path in (("version", "/api/v1/version"), ("status", "/api/v1/status")):
         try:
             response = http.get(path)
@@ -75,10 +108,12 @@ def server_info(client: Any) -> dict[str, Any]:
             payload = response.json()
         except Exception as exc:
             # Endpoints are probed opportunistically -- one may be absent on
-            # older servers -- but the failure is kept so that a total
-            # failure can be reported with its real cause rather than a
-            # blanket network error. A 401 here is an auth problem (10).
-            last_error = exc
+            # older servers -- but the failures are kept so that a total
+            # failure is reported with its real cause rather than a blanket
+            # network error, and so that an auth or availability problem is
+            # not masked by a 404 from the endpoint probed after it.
+            if _more_informative(exc, best_error):
+                best_error = exc
             continue
         if isinstance(payload, dict):
             info.update({f"{label}.{k}": v for k, v in payload.items()})
@@ -86,7 +121,7 @@ def server_info(client: Any) -> dict[str, Any]:
             info[label] = payload
 
     if not info:
-        if last_error is not None:
-            raise last_error
+        if best_error is not None:
+            raise best_error
         raise NetworkApiError("server did not report version or status information")
     return info

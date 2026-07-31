@@ -1635,9 +1635,15 @@ def test_csv_limit_does_not_parse_the_row_beyond_it(tmp_path: Path) -> None:
         assert read_records(path, RecordFormat.CSV, limit=1) == [
             {"id": "r1", "text": "ok"}
         ]
-        # Without a limit the same row is reached, and still fails.
-        with pytest.raises(csv.Error):
+        # Without a limit the same row is reached, and still fails -- as a
+        # classified validation error, not a raw csv.Error. The first version
+        # of this test asserted `pytest.raises(csv.Error)`, which pinned the
+        # bug that malformed input escaped as the unclassified exit 1.
+        from argilla_cli.errors import ValidationError
+
+        with pytest.raises(ValidationError) as excinfo:
             read_records(path, RecordFormat.CSV)
+        assert excinfo.value.exit_code == 13
     finally:
         csv.field_size_limit(limit)
 
@@ -1753,3 +1759,188 @@ def test_push_still_reports_an_empty_file_without_calling_the_server(
     )
 
     assert result.exit_code == 13, result.output
+
+
+# --------------------------------------------------------------------------
+# Round fourteen
+# --------------------------------------------------------------------------
+
+
+def test_malformed_csv_is_a_validation_error_not_exit_one(tmp_path: Path) -> None:
+    """A parser failure on the user's own file exits 13, like every other.
+
+    `csv.Error` lives in the `_csv` module and `UnicodeDecodeError` in
+    `builtins`; `map_exception` recognises neither, so both escaped as the
+    unclassified exit 1 while the JSONL path returned the documented 13.
+    """
+    from argilla_cli.errors import ValidationError
+
+    limit = csv.field_size_limit()
+    csv.field_size_limit(2000)
+    try:
+        oversized = tmp_path / "oversized.csv"
+        oversized.write_text("id,text\nr1," + "x" * 5000 + "\n", encoding="utf-8")
+
+        with pytest.raises(ValidationError) as excinfo:
+            read_records(oversized, RecordFormat.CSV)
+        assert excinfo.value.exit_code == 13
+        assert "malformed CSV" in str(excinfo.value)
+    finally:
+        csv.field_size_limit(limit)
+
+    bad_bytes = tmp_path / "bad.csv"
+    bad_bytes.write_bytes(b"id,text\nr1,\xff\xfe\n")
+    with pytest.raises(ValidationError) as excinfo:
+        read_records(bad_bytes, RecordFormat.CSV)
+    assert excinfo.value.exit_code == 13
+
+
+def test_push_of_malformed_csv_exits_13(runner: CliRunner, credentials: None) -> None:
+    """The same, end to end through the command."""
+    Path("bad.csv").write_bytes(b"id,text\nr1,\xff\xfe\n")
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "bad.csv"]
+    )
+
+    assert result.exit_code == 13, result.output
+
+
+def test_settings_export_refuses_to_clobber_without_force(
+    runner: CliRunner, credentials: None
+) -> None:
+    """Exporting over an existing file is a clean 13, not a raw traceback.
+
+    `Settings.to_json` raises `FileExistsError` for an existing path, which
+    `map_exception` does not recognise -- so this surfaced as the
+    unclassified exit 1 with no `--force` to resolve it, while `download`
+    next door had both.
+    """
+    existing = Path("settings.json")
+    existing.write_text('{"keep": "me"}', encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "settings",
+            "reviews",
+            "-w",
+            "nlp-lab",
+            "--export",
+            "settings.json",
+        ],
+    )
+
+    assert result.exit_code == 13, result.output
+    assert "--force" in result.output
+    assert existing.read_text() == '{"keep": "me"}'
+
+
+def test_settings_export_with_force_replaces_the_file(
+    runner: CliRunner, credentials: None
+) -> None:
+    """`--force` overwrites, and the result is valid JSON."""
+    existing = Path("settings.json")
+    existing.write_text('{"keep": "me"}', encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "settings",
+            "reviews",
+            "-w",
+            "nlp-lab",
+            "--export",
+            "settings.json",
+            "--force",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(existing.read_text()) != {"keep": "me"}
+
+
+def test_settings_export_is_atomic(
+    runner: CliRunner, credentials: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted export leaves no truncated settings file behind."""
+    import argilla_cli.atomic_io as atomic_io
+
+    def boom(src: Any, dst: Any) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(atomic_io.os, "replace", boom)
+
+    result = runner.invoke(
+        app,
+        ["dataset", "settings", "reviews", "-w", "nlp-lab", "--export", "out.json"],
+    )
+
+    assert result.exit_code != 0
+    assert not Path("out.json").exists()
+    assert list(Path.cwd().glob("*.partial")) == []
+
+
+def test_server_info_reports_auth_failure_over_a_missing_endpoint() -> None:
+    """A 401 must not be masked by a 404 from the endpoint probed after it.
+
+    Both endpoints are probed speculatively, so a 404 only means "this
+    server does not have that route" -- the least informative outcome there
+    is. Keeping whichever failure came last reported exit 12, "no such
+    thing", when the real answer was "your credentials are wrong".
+    """
+    from argilla_cli.clients.argilla_client import server_info
+    from argilla_cli.errors import map_exception
+
+    class _Response:
+        def __init__(self, status: int) -> None:
+            self.status_code = status
+
+        def raise_for_status(self) -> None:
+            raise _ApiError(f"HTTP {self.status_code}", self.status_code)
+
+        def json(self) -> Any:  # pragma: no cover - never reached
+            return {}
+
+    class _Client:
+        """/version rejects the credentials; /status is not on this server."""
+
+        def __init__(self) -> None:
+            self.http_client = self
+
+        def get(self, path: str) -> Any:
+            return _Response(401 if "version" in path else 404)
+
+    with pytest.raises(Exception) as excinfo:
+        server_info(_Client())
+
+    assert map_exception(excinfo.value).exit_code == 10
+
+
+def test_server_info_still_reports_a_lone_missing_endpoint() -> None:
+    """When 404 is all there is, it is still what gets reported."""
+    from argilla_cli.clients.argilla_client import server_info
+    from argilla_cli.errors import map_exception
+
+    class _Response:
+        status_code = 404
+
+        def raise_for_status(self) -> None:
+            raise _ApiError("HTTP 404", 404)
+
+        def json(self) -> Any:  # pragma: no cover - never reached
+            return {}
+
+    class _Client:
+        def __init__(self) -> None:
+            self.http_client = self
+
+        def get(self, path: str) -> Any:
+            return _Response()
+
+    with pytest.raises(Exception) as excinfo:
+        server_info(_Client())
+
+    assert map_exception(excinfo.value).exit_code == 12

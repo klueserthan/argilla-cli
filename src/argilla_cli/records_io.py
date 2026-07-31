@@ -581,12 +581,32 @@ def _iter_csv(path: Path, limit: int | None) -> Iterator[dict[str, Any]]:
     ``islice`` stops without pulling from the reader again, which the
     append-then-check loop this replaces could not do. ``DictReader`` skips
     blank rows internally, so each pull is one real record.
+
+    Pulled one row at a time rather than with a ``for`` loop so that parser
+    failures can be classified. ``csv.Error`` lives in the ``_csv`` module
+    and ``UnicodeDecodeError`` in ``builtins``; ``map_exception`` recognises
+    neither, so an oversized field or a bad byte in the user's own file
+    escaped as the unclassified exit 1 rather than the documented 13 that
+    every other malformed-input path returns.
     """
     with path.open(encoding="utf-8", newline="") as handle:
-        # CSV cells are flat, so undo the JSON encoding write_records applied
-        # to nested values and drop the filler cells standing in for keys a
-        # given row never had.
-        for row in islice(csv.DictReader(handle), limit):
+        reader = csv.DictReader(handle)
+        rows = islice(reader, limit)
+        while True:
+            try:
+                row = next(rows)
+            except StopIteration:
+                return
+            except (csv.Error, UnicodeDecodeError) as exc:
+                # line_num is the reader's position; decoding happens in
+                # buffered chunks, so for a bad byte it locates the region
+                # rather than the exact line.
+                raise ValidationError(
+                    f"{path}: malformed CSV near line {reader.line_num}: {exc}"
+                ) from exc
+            # CSV cells are flat, so undo the JSON encoding write_records
+            # applied to nested values and drop the filler cells standing in
+            # for keys a given row never had.
             yield _restore_row(row)
 
 
