@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from itertools import islice
 from pathlib import Path
 from typing import Annotated, Any
@@ -25,8 +26,8 @@ from argilla_cli.records_io import (
     filter_completed,
     infer_format,
     iter_dataset_records,
+    iter_records,
     load_mapping,
-    read_records,
     resolve_target_path,
     strip_server_ids,
     transform_record,
@@ -47,6 +48,10 @@ _COLUMNS = ["name", "workspace", "id", "created_at", "description"]
 #: source at a smaller size and batches its own uploads, so this only bounds
 #: what the CLI itself accumulates between the two.
 _COPY_BATCH_SIZE = 500
+
+#: How many records `dataset push` reads, maps and uploads at a time.
+#: Matched to the copy path so both bound their memory the same way.
+_PUSH_BATCH_SIZE = 500
 
 MapOpt = Annotated[
     Path | None,
@@ -371,19 +376,39 @@ def push(
     """
     dataset = resolve_dataset(ctx.client(), name, resolve_workspace_name(workspace))
 
-    # The limit is passed down rather than applied afterwards, so a large
-    # file is not parsed in full just to upload the first few records.
-    rows = read_records(source, infer_format(source, fmt), limit)
+    # Records are read, mapped and uploaded in batches, so the file never has
+    # to fit in memory. The limit is passed down rather than applied
+    # afterwards, so a large file is not parsed in full to upload the first
+    # few records, and `--map` transforms one batch at a time instead of
+    # building a second full list beside the first.
+    #
+    # Batching here does not make a partial upload newly possible: the SDK's
+    # `log()` already chunks its argument (batch_size=256) and issues a
+    # request per chunk, so a failure part-way through always left the
+    # earlier records in place. What changes is only how much the CLI holds.
+    stream: Iterator[dict[str, Any]] = iter_records(
+        source, infer_format(source, fmt), limit
+    )
     if map_file is not None:
         compiled = compile_mapping(load_mapping(map_file))
-        rows = [transform_record(row, compiled, list_policy, list_sep) for row in rows]
-    if not rows:
+        stream = (
+            transform_record(row, compiled, list_policy, list_sep) for row in stream
+        )
+
+    # Read the first batch before logging anything, so an empty file is
+    # reported without a pointless round-trip to the server.
+    batch = list(islice(stream, _PUSH_BATCH_SIZE))
+    if not batch:
         raise ValidationError(f"no records found in {source}")
 
-    dataset.records.log(rows)
+    count = 0
+    while batch:
+        dataset.records.log(batch)
+        count += len(batch)
+        batch = list(islice(stream, _PUSH_BATCH_SIZE))
 
-    print_ok(f"Pushed {len(rows)} record(s) to '{name}'")
-    render({"dataset": name, "records": len(rows), "source": str(source)})
+    print_ok(f"Pushed {count} record(s) to '{name}'")
+    render({"dataset": name, "records": count, "source": str(source)})
 
 
 @app.command("copy")

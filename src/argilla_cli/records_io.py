@@ -13,6 +13,7 @@ import json
 import tempfile
 from collections.abc import Iterable, Iterator
 from enum import StrEnum
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -499,54 +500,103 @@ def _write_parquet(rows: Iterable[dict[str, Any]], path: Path) -> int:
 # --------------------------------------------------------------------------
 
 
-def read_records(
+def iter_records(
     path: Path, fmt: RecordFormat, limit: int | None = None
-) -> list[dict[str, Any]]:
-    """Read records from a local file, stopping once ``limit`` are collected.
+) -> Iterator[dict[str, Any]]:
+    """Stream records from a local file, parsing no further than ``limit``.
 
-    The text formats stop parsing at the limit rather than reading everything
-    and slicing afterwards. That keeps ``push --limit 5`` cheap on a large
-    file, and means malformed content *after* the fifth record cannot fail an
+    The text formats stop parsing *at* the limit rather than reading
+    everything and slicing afterwards, so ``push --limit 5`` stays cheap on a
+    large file and malformed content after the fifth record cannot fail an
     upload that was never going to read it.
 
-    Parquet is columnar, so pandas materialises the file regardless; the
-    limit is applied after the read there.
+    Reaching the limit has to be checked *before* asking for the next record,
+    not after appending one. ``for row in reader:`` parses row N+1 and only
+    then runs the loop body's check, so a row beyond the limit could still
+    raise -- an oversized CSV field, or an undecodable byte on the next JSONL
+    line -- for content the caller had excluded.
+
+    Not a generator itself: the missing-file check runs when this is called
+    rather than when iteration starts, so a bad path fails where the caller
+    expects it to.
     """
     if not path.is_file():
         raise ValidationError(f"input file not found: {path}")
 
     if fmt is RecordFormat.JSONL:
-        rows: list[dict[str, Any]] = []
-        with path.open(encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, start=1):
-                if limit is not None and len(rows) >= limit:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValidationError(
-                        f"{path}:{line_no}: invalid JSON ({exc})"
-                    ) from exc
-                if not isinstance(payload, dict):
-                    raise ValidationError(f"{path}:{line_no}: expected a JSON object")
-                rows.append(payload)
-        return rows
-
-    # CSV and Parquet cells are flat, so undo the JSON encoding that
-    # write_records applied to nested values, and drop the filler cells
-    # that stand in for keys a given row never had.
+        return _iter_jsonl(path, limit)
     if fmt is RecordFormat.CSV:
-        csv_rows: list[dict[str, Any]] = []
-        with path.open(encoding="utf-8", newline="") as handle:
-            for row in csv.DictReader(handle):
-                if limit is not None and len(csv_rows) >= limit:
-                    break
-                csv_rows.append(_restore_row(row))
-        return csv_rows
+        return _iter_csv(path, limit)
+    return _iter_parquet(path, limit)
 
+
+def _iter_jsonl(path: Path, limit: int | None) -> Iterator[dict[str, Any]]:
+    """Stream JSONL, decoding no more lines than the limit calls for.
+
+    Blank lines are skipped without counting, so this cannot be an ``islice``
+    over the handle: that would stop after ``limit`` *lines* and return fewer
+    records than asked for.
+
+    Opened in binary and decoded a line at a time, which is what actually
+    bounds the work. A text-mode handle decodes a whole buffer per read, so
+    an undecodable byte anywhere in the first chunk raises while fetching
+    line 1 -- checking the count before pulling would not have helped, since
+    the damage is done inside the read. Decoding per line also lets a bad
+    byte be reported with its line number and the validation exit code,
+    rather than escaping as a bare ``UnicodeDecodeError`` and exit 1.
+    """
+    with path.open("rb") as handle:
+        lines = iter(handle)
+        line_no = 0
+        count = 0
+        while limit is None or count < limit:
+            try:
+                raw = next(lines)
+            except StopIteration:
+                return
+            line_no += 1
+            try:
+                stripped = raw.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                raise ValidationError(
+                    f"{path}:{line_no}: invalid UTF-8 ({exc})"
+                ) from exc
+            if not stripped:
+                continue
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValidationError(
+                    f"{path}:{line_no}: invalid JSON ({exc})"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValidationError(f"{path}:{line_no}: expected a JSON object")
+            count += 1
+            yield payload
+
+
+def _iter_csv(path: Path, limit: int | None) -> Iterator[dict[str, Any]]:
+    """Stream CSV, parsing exactly ``limit`` rows and not one more.
+
+    ``islice`` stops without pulling from the reader again, which the
+    append-then-check loop this replaces could not do. ``DictReader`` skips
+    blank rows internally, so each pull is one real record.
+    """
+    with path.open(encoding="utf-8", newline="") as handle:
+        # CSV cells are flat, so undo the JSON encoding write_records applied
+        # to nested values and drop the filler cells standing in for keys a
+        # given row never had.
+        for row in islice(csv.DictReader(handle), limit):
+            yield _restore_row(row)
+
+
+def _iter_parquet(path: Path, limit: int | None) -> Iterator[dict[str, Any]]:
+    """Read Parquet, which is columnar and so cannot be streamed by row.
+
+    pandas materialises the file whatever the limit is, so this bounds only
+    what is handed onward. Callers pushing something too large to hold should
+    use JSONL, which streams end to end.
+    """
     pd = _require_pandas()
     try:
         frame = pd.read_parquet(path)
@@ -567,7 +617,19 @@ def read_records(
     records = frame.to_dict(orient="records")
     if limit is not None:
         records = records[:limit]
-    return [_restore_row(record) for record in records]
+    return (_restore_row(record) for record in records)
+
+
+def read_records(
+    path: Path, fmt: RecordFormat, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Collect records from a local file into a list.
+
+    Prefer :func:`iter_records` where the caller can consume incrementally;
+    this is the convenience wrapper for the places that genuinely want the
+    whole set in hand.
+    """
+    return list(iter_records(path, fmt, limit))
 
 
 def _restore_row(row: dict[str, Any]) -> dict[str, Any]:

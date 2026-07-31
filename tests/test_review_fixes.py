@@ -1611,3 +1611,145 @@ def test_saved_config_is_never_briefly_world_readable(
         f"credentials were group/world readable ({modes[0]:o})"
     )
     assert config.stat().st_mode & 0o077 == 0
+
+
+# --------------------------------------------------------------------------
+# Round thirteen
+# --------------------------------------------------------------------------
+
+
+def test_csv_limit_does_not_parse_the_row_beyond_it(tmp_path: Path) -> None:
+    """`--limit N` must not parse row N+1, only stop after it.
+
+    `for row in reader:` pulls the next row and *then* runs the loop body's
+    check, so the row past the limit was parsed before the break. A row the
+    caller excluded could therefore still fail the read -- here an oversized
+    field, which `csv` refuses outright.
+    """
+    limit = csv.field_size_limit()
+    csv.field_size_limit(2000)
+    try:
+        path = tmp_path / "oversized.csv"
+        path.write_text("id,text\nr1,ok\nr2," + "x" * 5000 + "\n", encoding="utf-8")
+
+        assert read_records(path, RecordFormat.CSV, limit=1) == [
+            {"id": "r1", "text": "ok"}
+        ]
+        # Without a limit the same row is reached, and still fails.
+        with pytest.raises(csv.Error):
+            read_records(path, RecordFormat.CSV)
+    finally:
+        csv.field_size_limit(limit)
+
+
+def test_jsonl_limit_does_not_decode_the_line_beyond_it(tmp_path: Path) -> None:
+    """The same guarantee for JSONL, which needed more than a loop change.
+
+    A text-mode handle decodes a whole buffer per read, so an undecodable
+    byte on line 2 raised while line 1 was being fetched -- checking the
+    count before pulling could not help, because the damage happens inside
+    the read. Reading bytes and decoding per line is what actually bounds it.
+    """
+    path = tmp_path / "bad-bytes.jsonl"
+    path.write_bytes(b'{"id": "r1"}\n{"id": "\xff\xfe"}\n')
+
+    assert read_records(path, RecordFormat.JSONL, limit=1) == [{"id": "r1"}]
+
+
+def test_undecodable_input_is_a_validation_error_with_its_line(
+    tmp_path: Path,
+) -> None:
+    """A bad byte names its line and exits 13, rather than escaping as 1.
+
+    `UnicodeDecodeError` is not something `map_exception` recognises, so it
+    previously became the unclassified exit code with no indication of where
+    in the file the problem was.
+    """
+    from argilla_cli.errors import ValidationError
+
+    path = tmp_path / "bad-bytes.jsonl"
+    path.write_bytes(b'{"id": "r1"}\n{"id": "\xff\xfe"}\n')
+
+    with pytest.raises(ValidationError) as excinfo:
+        read_records(path, RecordFormat.JSONL)
+
+    assert excinfo.value.exit_code == 13
+    assert ":2:" in str(excinfo.value)
+
+
+def test_blank_lines_do_not_consume_the_limit(tmp_path: Path) -> None:
+    """Bounding the read must not turn blank lines into records.
+
+    This is why the JSONL path cannot simply be `islice` over the handle:
+    that stops after N *lines*, so a file padded with blanks would return
+    fewer records than asked for.
+    """
+    path = tmp_path / "padded.jsonl"
+    path.write_text('{"id": 1}\n\n\n{"id": 2}\n{"id": 3}\n', encoding="utf-8")
+
+    assert read_records(path, RecordFormat.JSONL, limit=2) == [{"id": 1}, {"id": 2}]
+
+
+def test_push_uploads_in_bounded_batches(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla, monkeypatch: Any
+) -> None:
+    """An unlimited push must not hold the whole file in memory.
+
+    `read_records` returned a list and `--map` built a second one beside it,
+    so a large upload could exhaust memory before a single record reached the
+    server. Reading, mapping and logging now run a batch at a time.
+
+    Observed through the size of each `log()` call: bounded batches mean no
+    single call carries more than the batch size.
+    """
+    from argilla_cli.commands import dataset as dataset_cmd
+
+    monkeypatch.setattr(dataset_cmd, "_PUSH_BATCH_SIZE", 10)
+
+    Path("many.jsonl").write_text(
+        "\n".join(json.dumps({"id": f"r{i}"}) for i in range(25)) + "\n",
+        encoding="utf-8",
+    )
+
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    batches: list[int] = []
+    real_log = intents.records.log
+
+    def counting_log(records: list[dict[str, Any]]) -> None:
+        batches.append(len(records))
+        real_log(records)
+
+    intents.records.log = counting_log  # type: ignore[assignment]
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "many.jsonl"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert batches == [10, 10, 5], f"expected bounded batches, got {batches}"
+    assert len(intents.records.logged) == 25
+    assert "25" in result.output
+
+
+def test_push_still_reports_an_empty_file_without_calling_the_server(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla
+) -> None:
+    """Batching must not lose the empty-input check, or make it cost a call.
+
+    The first batch is read before anything is logged, so an empty file is
+    still exit 13 and the server is never touched.
+    """
+    Path("empty.jsonl").write_text("", encoding="utf-8")
+
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+
+    def fail_log(records: list[dict[str, Any]]) -> None:
+        raise AssertionError("log() called for an empty input")
+
+    intents.records.log = fail_log  # type: ignore[assignment]
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "empty.jsonl"]
+    )
+
+    assert result.exit_code == 13, result.output
