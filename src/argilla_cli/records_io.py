@@ -472,8 +472,19 @@ def _write_to(rows: Iterable[dict[str, Any]], path: Path, fmt: RecordFormat) -> 
 # --------------------------------------------------------------------------
 
 
-def read_records(path: Path, fmt: RecordFormat) -> list[dict[str, Any]]:
-    """Read records from a local file."""
+def read_records(
+    path: Path, fmt: RecordFormat, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Read records from a local file, stopping once ``limit`` are collected.
+
+    The text formats stop parsing at the limit rather than reading everything
+    and slicing afterwards. That keeps ``push --limit 5`` cheap on a large
+    file, and means malformed content *after* the fifth record cannot fail an
+    upload that was never going to read it.
+
+    Parquet is columnar, so pandas materialises the file regardless; the
+    limit is applied after the read there.
+    """
     if not path.is_file():
         raise ValidationError(f"input file not found: {path}")
 
@@ -481,6 +492,8 @@ def read_records(path: Path, fmt: RecordFormat) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         with path.open(encoding="utf-8") as handle:
             for line_no, line in enumerate(handle, start=1):
+                if limit is not None and len(rows) >= limit:
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -499,8 +512,13 @@ def read_records(path: Path, fmt: RecordFormat) -> list[dict[str, Any]]:
     # write_records applied to nested values, and drop the filler cells
     # that stand in for keys a given row never had.
     if fmt is RecordFormat.CSV:
+        csv_rows: list[dict[str, Any]] = []
         with path.open(encoding="utf-8", newline="") as handle:
-            return [_restore_row(row) for row in csv.DictReader(handle)]
+            for row in csv.DictReader(handle):
+                if limit is not None and len(csv_rows) >= limit:
+                    break
+                csv_rows.append(_restore_row(row))
+        return csv_rows
 
     pd = _require_pandas()
     try:
@@ -511,7 +529,18 @@ def read_records(path: Path, fmt: RecordFormat) -> list[dict[str, Any]]:
         raise MissingExtraError(
             "Parquet support", "export", "argilla-cli[export]"
         ) from exc
-    return [_restore_row(record) for record in frame.to_dict(orient="records")]
+    except Exception as exc:
+        # A corrupt or mislabelled file raises an engine-specific decoding
+        # error (pyarrow.lib.ArrowInvalid and friends) that the mapper has no
+        # reason to recognise. It is bad user input, so name it as such.
+        if is_classified(exc):
+            raise
+        raise ValidationError(f"could not read Parquet file {path}: {exc}") from exc
+
+    records = frame.to_dict(orient="records")
+    if limit is not None:
+        records = records[:limit]
+    return [_restore_row(record) for record in records]
 
 
 def _restore_row(row: dict[str, Any]) -> dict[str, Any]:

@@ -91,14 +91,24 @@ def _status_code_of(exc: BaseException) -> int | None:
 
 
 def _map_status(status: int, message: str) -> CLIError:
+    """Map an HTTP status onto the documented exit codes.
+
+    Every status is assigned, deliberately. Listing only the familiar few
+    left 408, 413 and 429 falling through to the unclassified exit 1 -- a
+    rate-limited request reported as "unexpected error" rather than as
+    something to retry.
+    """
     if status in (401, 403):
         return AuthConfigError(message)
     if status == 404:
         return NotFoundError(message)
-    if status in (400, 409, 422):
-        return ValidationError(message)
-    if status >= 500:
+    # Timeouts and throttling are availability problems: the request was
+    # fine, the server could not take it now.
+    if status in (408, 429) or status >= 500:
         return NetworkApiError(message)
+    if 400 <= status < 500:
+        # Any other 4xx means the server rejected what we sent.
+        return ValidationError(message)
     return CLIError(message)
 
 

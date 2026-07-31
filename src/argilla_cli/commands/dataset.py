@@ -366,9 +366,9 @@ def push(
     """
     dataset = resolve_dataset(ctx.client(), name, resolve_workspace_name(workspace))
 
-    rows = read_records(source, infer_format(source, fmt))
-    if limit is not None:
-        rows = rows[:limit]
+    # The limit is passed down rather than applied afterwards, so a large
+    # file is not parsed in full just to upload the first few records.
+    rows = read_records(source, infer_format(source, fmt), limit)
     if map_file is not None:
         compiled = compile_mapping(load_mapping(map_file))
         rows = [transform_record(row, compiled, list_policy, list_sep) for row in rows]

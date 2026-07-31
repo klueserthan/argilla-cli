@@ -1135,3 +1135,134 @@ def test_argilla_local_errors_are_bad_input(error_name: str) -> None:
 
     assert isinstance(mapped, CLIValidationError), f"{error_name} -> {type(mapped)}"
     assert mapped.exit_code == 13
+
+
+# ---------------------------------------------------------------------------
+# Ninth review round
+# ---------------------------------------------------------------------------
+
+
+def test_push_limit_stops_parsing_the_input(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla
+) -> None:
+    """`push --limit N` must not parse the whole file first.
+
+    Proven by putting invalid JSON *after* the Nth record: if parsing stops
+    at the limit the upload succeeds, and if it does not the malformed line
+    fails an upload that should never have read it.
+    """
+    Path("big.jsonl").write_text(
+        "\n".join(json.dumps({"id": f"r{i}"}) for i in range(3))
+        + "\n{ this line is not valid json\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "push",
+            "intents",
+            "-w",
+            "nlp-lab",
+            "--from",
+            "big.jsonl",
+            "--limit",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    assert len(intents.records.logged) == 2
+
+
+def test_push_without_limit_still_reports_malformed_input(
+    runner: CliRunner, credentials: None
+) -> None:
+    """Without a limit the whole file is read, so bad lines are still caught."""
+    Path("bad.jsonl").write_text(
+        json.dumps({"id": "r1"}) + "\n{ not json\n", encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app, ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "bad.jsonl"]
+    )
+
+    assert result.exit_code == 13, result.output
+
+
+def test_csv_push_limit_stops_parsing(
+    runner: CliRunner, credentials: None, fake_client: FakeArgilla
+) -> None:
+    """The CSV reader honours the limit too."""
+    write_records(
+        [{"id": f"r{i}"} for i in range(50)], Path("many.csv"), RecordFormat.CSV
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "push",
+            "intents",
+            "-w",
+            "nlp-lab",
+            "--from",
+            "many.csv",
+            "--limit",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    intents = next(ds for ds in fake_client._datasets if ds.name == "intents")
+    assert len(intents.records.logged) == 3
+
+
+def test_corrupt_parquet_is_a_validation_error(
+    runner: CliRunner, credentials: None
+) -> None:
+    """A corrupt or mislabelled Parquet file exits 13, not a generic 1.
+
+    The engine raises its own decoding error (pyarrow.lib.ArrowInvalid),
+    which the mapper has no reason to recognise.
+    """
+    Path("corrupt.parquet").write_text("definitely not parquet", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["dataset", "push", "intents", "-w", "nlp-lab", "--from", "corrupt.parquet"],
+    )
+
+    assert result.exit_code == 13, result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_exit"),
+    [
+        (400, 13),
+        (401, 10),
+        (403, 10),
+        (404, 12),
+        (408, 11),
+        (409, 13),
+        (413, 13),
+        (422, 13),
+        (429, 11),
+        (500, 11),
+        (503, 11),
+    ],
+)
+def test_every_http_status_maps_to_a_documented_code(
+    status_code: int, expected_exit: int
+) -> None:
+    """No HTTP status falls through to the unclassified exit 1.
+
+    408, 413 and 429 previously did: a rate-limited request was reported as
+    an unexpected error rather than as something to retry.
+    """
+    mapped = map_exception(_ApiError(f"http {status_code}", status_code))
+
+    assert mapped.exit_code == expected_exit, f"{status_code} -> {mapped.exit_code}"
