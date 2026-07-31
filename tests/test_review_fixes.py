@@ -1459,3 +1459,155 @@ def test_copy_rolls_back_on_keyboard_interrupt(
     assert created and created[0].deleted is True, (
         "destination should be rolled back even on interrupt"
     )
+
+
+# --------------------------------------------------------------------------
+# Round twelve
+# --------------------------------------------------------------------------
+
+
+def test_csv_export_does_not_retain_every_record(tmp_path: Path) -> None:
+    """CSV must stream, not collect the dataset to learn its columns.
+
+    CSV needs the union of every row's keys before it can write a header, and
+    the obvious way to get that -- `list(rows)` -- quietly undid the lazy
+    record iterator on the format most likely to be pointed at a large
+    export. The rows paged in a batch at a time and then all sat in memory.
+
+    Retention is measured from inside the producer, because after the write
+    returns every row is unreachable either way. Each row is dropped by the
+    generator right after it is yielded, so anything still alive is held by
+    the writer.
+    """
+    import gc
+    import weakref
+
+    class _Row(dict[str, Any]):
+        """A dict that can be weak-referenced, so retention is observable."""
+
+    alive_at_end: list[int] = []
+    row_count = 50
+
+    def produce() -> Iterator[dict[str, Any]]:
+        refs: list[weakref.ReferenceType[_Row]] = []
+        for index in range(row_count):
+            row = _Row(id=f"r{index}", text="x" * 200)
+            refs.append(weakref.ref(row))
+            yield row
+            del row
+        gc.collect()
+        alive_at_end.append(sum(1 for ref in refs if ref() is not None))
+
+    written = write_records(produce(), tmp_path / "out.csv", RecordFormat.CSV)
+
+    assert written == row_count
+    # The writer's own loop variable still holds the final row; everything
+    # earlier must have been released. Materialising held all 50.
+    assert alive_at_end and alive_at_end[0] < 10, (
+        f"writer retained {alive_at_end} of {row_count} rows; CSV is not streaming"
+    )
+
+
+def test_csv_export_keeps_the_union_of_columns_while_streaming(
+    tmp_path: Path,
+) -> None:
+    """Streaming must not narrow the header to the first row's keys.
+
+    Spooling makes it tempting to fix the header early. A row whose extra
+    keys arrive later would then be silently truncated, because the writer
+    uses `extrasaction="ignore"`.
+    """
+    rows = [
+        {"id": "r0", "text": "first"},
+        {"id": "r1", "metadata": {"split": "train"}},
+        {"id": "r2", "score": 0.5},
+    ]
+    path = tmp_path / "ragged.csv"
+    write_records(iter(rows), path, RecordFormat.CSV)
+
+    with path.open(newline="") as handle:
+        parsed = list(csv.DictReader(handle))
+
+    assert set(parsed[0]) == {"id", "text", "metadata", "score"}
+    assert [r["id"] for r in parsed] == ["r0", "r1", "r2"]
+    # Nested values survive the spool's JSON round-trip as encoded text...
+    assert json.loads(parsed[1]["metadata"]) == {"split": "train"}
+    # ...and absent keys stay absent rather than becoming empty strings.
+    assert read_records(path, RecordFormat.CSV)[0] == {"id": "r0", "text": "first"}
+
+
+def test_saving_a_profile_leaves_the_old_config_intact_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed config write must not destroy the stored credentials.
+
+    `write_bytes` truncates the only copy of every API key the moment it
+    opens the file, so a full disk or a Ctrl+C left invalid TOML behind --
+    which `load_store` then rejects, failing every later command too.
+    """
+    import argilla_cli.atomic_io as atomic_io
+    from argilla_cli.profiles import ProfileStore, load_store, save_store
+
+    config = tmp_path / "config.toml"
+    monkeypatch.setenv("ARGILLA_CLI_CONFIG", str(config))
+
+    save_store(
+        ProfileStore(
+            current="prod",
+            profiles={"prod": {"api_key": "keep-me"}},
+            path=config,
+        )
+    )
+    original = config.read_bytes()
+
+    def boom(src: Any, dst: Any) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(atomic_io.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        save_store(
+            ProfileStore(
+                current="staging",
+                profiles={"staging": {"api_key": "new"}},
+                path=config,
+            )
+        )
+
+    assert config.read_bytes() == original
+    assert load_store().profiles["prod"]["api_key"] == "keep-me"
+    # ...and the abandoned temporary file is not left behind next to it.
+    assert [p.name for p in tmp_path.glob("*.partial")] == []
+
+
+def test_saved_config_is_never_briefly_world_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The credentials are private *before* the file becomes the config.
+
+    Asserting the mode of the finished file proves nothing: writing in place
+    and calling `chmod` afterwards ends up at 0o600 too. What changed is the
+    window in between, where the old code had the API keys sitting in a
+    world-readable file. So the check is made against the file actually
+    holding the payload, at the moment it is put into place.
+    """
+    import argilla_cli.atomic_io as atomic_io
+    from argilla_cli.profiles import ProfileStore, save_store
+
+    real_replace = atomic_io.os.replace
+    modes: list[int] = []
+
+    def record_then_replace(src: Any, dst: Any) -> None:
+        modes.append(Path(src).stat().st_mode & 0o777)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(atomic_io.os, "replace", record_then_replace)
+
+    config = tmp_path / "config.toml"
+    save_store(ProfileStore(profiles={"prod": {"api_key": "secret"}}, path=config))
+
+    assert modes, "config was written in place rather than replaced atomically"
+    assert modes[0] & 0o077 == 0, (
+        f"credentials were group/world readable ({modes[0]:o})"
+    )
+    assert config.stat().st_mode & 0o077 == 0

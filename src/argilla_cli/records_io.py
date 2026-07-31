@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import tempfile
 from collections.abc import Iterable, Iterator
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from argilla_cli.atomic_io import atomic_path
 from argilla_cli.errors import MissingExtraError, ValidationError, is_classified
 
 
@@ -407,25 +407,9 @@ def write_records(rows: Iterable[dict[str, Any]], path: Path, fmt: RecordFormat)
     moment the file was opened, so a stream that failed part-way left a
     half-written export in place -- and with ``--force``, destroyed a
     previously good one before knowing the replacement would succeed.
-
-    The temporary file shares the target's directory so that ``os.replace``
-    is a same-filesystem rename, which is atomic.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    handle_fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".partial"
-    )
-    os.close(handle_fd)
-    tmp_path = Path(tmp_name)
-
-    try:
-        count = _write_to(rows, tmp_path, fmt)
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    return count
+    with atomic_path(path) as tmp_path:
+        return _write_to(rows, tmp_path, fmt)
 
 
 def _write_to(rows: Iterable[dict[str, Any]], path: Path, fmt: RecordFormat) -> int:
@@ -438,26 +422,69 @@ def _write_to(rows: Iterable[dict[str, Any]], path: Path, fmt: RecordFormat) -> 
                 count += 1
         return count
 
-    materialized = list(rows)
-
     if fmt is RecordFormat.CSV:
-        columns: dict[str, None] = {}
-        for row in materialized:
-            for key in row:
+        return _write_csv(rows, path)
+    return _write_parquet(rows, path)
+
+
+def _write_csv(rows: Iterable[dict[str, Any]], path: Path) -> int:
+    """Write CSV without holding the whole dataset in memory.
+
+    CSV needs its header first, and the header is the union of every row's
+    keys -- which is only known after the last row has been seen. Collecting
+    the records to learn it would undo the lazy record iterator on the one
+    format most likely to be pointed at a large export: the rows streamed in
+    a batch at a time and then all sat in RAM anyway.
+
+    So rows are spooled to a scratch file as they arrive, carrying only the
+    column names in memory, and replayed once the union is complete. Peak
+    memory becomes proportional to the number of *columns* rather than the
+    number of records. The cost is transient disk roughly the size of the
+    export, taken in the destination's own filesystem where that space is
+    what the user is already spending.
+
+    Keys are stringified on the way in so that the header and the replayed
+    rows agree: JSON object keys are always strings, so a non-string key
+    would come back as one and no longer match its own column. The written
+    output is unchanged, since ``csv`` stringifies field names anyway.
+    """
+    columns: dict[str, None] = {}
+    count = 0
+
+    # Unlinked immediately on POSIX, so it never appears in the output
+    # directory even while it is being written.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", dir=path.parent) as spool:
+        for row in rows:
+            scalar = {str(k): _scalarize(v) for k, v in row.items()}
+            for key in scalar:
                 columns.setdefault(key, None)
+            spool.write(json.dumps(scalar, ensure_ascii=False, default=str) + "\n")
+            count += 1
+
+        spool.seek(0)
         with path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
                 handle, fieldnames=list(columns), extrasaction="ignore"
             )
             writer.writeheader()
-            for row in materialized:
-                writer.writerow({k: _scalarize(v) for k, v in row.items()})
-        return len(materialized)
+            for line in spool:
+                writer.writerow(json.loads(line))
 
+    return count
+
+
+def _write_parquet(rows: Iterable[dict[str, Any]], path: Path) -> int:
+    """Write Parquet, which is columnar and so needs the full set of rows.
+
+    Unlike CSV this cannot stream: pandas builds the frame before any of it
+    is encoded. Writing row groups incrementally would need the schema fixed
+    up front, which the union-of-columns behaviour does not have. Callers
+    exporting something too large to hold should choose JSONL, which streams
+    end to end.
+    """
     pd = _require_pandas()
-    frame = pd.DataFrame(
-        [{k: _scalarize(v) for k, v in r.items()} for r in materialized]
-    )
+    materialized = [{k: _scalarize(v) for k, v in r.items()} for r in rows]
+    frame = pd.DataFrame(materialized)
     try:
         frame.to_parquet(path, index=False)
     except ImportError as exc:

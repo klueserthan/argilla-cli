@@ -25,6 +25,7 @@ from typing import Any
 
 import tomli_w
 
+from argilla_cli.atomic_io import atomic_path
 from argilla_cli.errors import NotFoundError, ValidationError
 
 #: Keys a profile is allowed to hold, mapped to the env var they stand in for.
@@ -119,19 +120,30 @@ def load_store() -> ProfileStore:
 
 
 def save_store(store: ProfileStore) -> None:
-    """Write the config file, creating parents and keeping it user-private."""
+    """Write the config file atomically, keeping it user-private.
+
+    This file is the only copy of every stored API key, so it is replaced
+    rather than rewritten in place: writing straight to it truncates it the
+    moment it is opened, and a full disk or a Ctrl+C then leaves invalid
+    TOML where the credentials were -- which ``load_store`` rejects, so every
+    subsequent command fails too.
+
+    Serialising before opening anything matters for the same reason: a
+    profile value that ``tomli_w`` cannot encode raises here, with the
+    existing file untouched.
+
+    ``atomic_path`` creates the temporary file 0o600, so the keys are never
+    briefly world-readable. The previous write-then-``chmod`` could not
+    promise that.
+    """
     payload: dict[str, Any] = {}
     if store.current:
         payload["current"] = store.current
     payload["profiles"] = store.profiles
 
-    store.path.parent.mkdir(parents=True, exist_ok=True)
-    store.path.write_bytes(tomli_w.dumps(payload).encode("utf-8"))
-    # The file holds API keys; don't leave it world-readable.
-    try:
-        store.path.chmod(0o600)
-    except OSError:  # pragma: no cover - platform dependent
-        pass
+    encoded = tomli_w.dumps(payload).encode("utf-8")
+    with atomic_path(store.path) as tmp_path:
+        tmp_path.write_bytes(encoded)
 
 
 def validate_key(key: str) -> str:
