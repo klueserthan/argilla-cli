@@ -12,6 +12,7 @@ from typing import Annotated
 import typer
 
 from argilla_cli import __version__, io_utils
+from argilla_cli.commands import annotate as annotate_cmd
 from argilla_cli.commands import config as config_cmd
 from argilla_cli.commands import dataset as dataset_cmd
 from argilla_cli.commands import server as server_cmd
@@ -29,6 +30,7 @@ app = typer.Typer(
 app.add_typer(config_cmd.app, name="config")
 app.add_typer(workspace_cmd.app, name="workspace")
 app.add_typer(dataset_cmd.app, name="dataset")
+app.add_typer(annotate_cmd.app, name="annotate")
 app.add_typer(user_cmd.app, name="user")
 app.add_typer(server_cmd.app, name="server")
 
