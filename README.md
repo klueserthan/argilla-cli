@@ -232,6 +232,59 @@ argilla-cli dataset to-hub my-ds org/my-ds -w my-ws --private
 argilla-cli dataset from-hub org/my-ds --name my-ds -w my-ws
 ```
 
+### `annotate` — label records as the calling user
+
+Every other group administers a server; this one does the annotation work.
+It talks to Argilla's `/me` endpoints, which any member of the dataset's
+workspace may use, so the same three commands work under an **annotator**,
+admin or owner key — the key decides whose responses are read and written.
+
+| Command | What it does |
+|---|---|
+| `annotate next <dataset>` | Show the record(s) still waiting for your response. |
+| `annotate submit <dataset> <record-id>` | Answer one record. |
+| `annotate discard <dataset> <record-id>` | Discard one record. |
+
+```bash
+# what should I annotate next? (one record by default)
+argilla-cli annotate next my-ds -w my-ws
+argilla-cli -o json annotate next my-ds -w my-ws --limit 5
+
+# answer it: --answer is repeatable, and splits on the first `=`
+argilla-cli annotate submit my-ds 1f0c… -w my-ws --answer label=positive
+argilla-cli annotate submit my-ds 1f0c… --answer label=positive --answer rating=4
+
+# park an answer without submitting it
+argilla-cli annotate submit my-ds 1f0c… --answer label=positive --status draft
+
+# multi-question or structured answers: a JSON object, from a file or stdin
+argilla-cli annotate submit my-ds 1f0c… --from answers.json
+echo '{"label": "positive", "topics": ["pricing", "support"]}' \
+  | argilla-cli annotate submit my-ds 1f0c… --from -
+
+# not annotatable
+argilla-cli annotate discard my-ds 1f0c… -w my-ws
+```
+
+Notes:
+
+- **The record id comes from `annotate next`.** It is the server's own record
+  id; `-o json` gives you it alongside the record's `fields`, its
+  `suggestions`, your own existing `my_responses`, and `pending_total` — how
+  many records the server still has waiting for you.
+- **`--answer` values are JSON when they parse as JSON**, and the literal
+  string otherwise. So `rating=4` sends the number `4`, `topics=["a","b"]`
+  sends a list, and `label=positive` sends the string.
+- **`--answer` and `--from` are mutually exclusive**, and one of them is
+  required; passing both or neither exits **13**.
+- `--status` accepts `submitted` (default) or `draft`. Anything else is a
+  usage error (exit **2**) — discarding has its own command.
+- `discard` is not gated behind a confirmation prompt: it writes *your*
+  response and destroys nothing shared, and you can submit an answer
+  afterwards to replace it.
+- A key without access to the dataset's workspace exits **10**; an unknown
+  dataset or record exits **12**.
+
 ### `user` — manage users
 
 ```bash

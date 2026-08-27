@@ -20,6 +20,7 @@ turn a half-finished command into a recoverable one.
 | `config` | `show`, `doctor`, `list`, `set`, `get`, `use`, `remove` |
 | `workspace` | `list`, `show`, `create`, `delete`, `users`, `add-user`, `remove-user` |
 | `dataset` | `list`, `show`, `progress`, `create`, `delete`, `settings`, `download`, `push`, `copy`, `to-hub`, `from-hub` |
+| `annotate` | `next`, `submit`, `discard` |
 | `user` | `me`, `list`, `show`, `create`, `delete`, `add-to-workspace`, `remove-from-workspace` |
 | `server` | `info`, `whoami`, `health` |
 
@@ -32,8 +33,8 @@ That rule is about *presentation and connection* state — `-o`, `-v`, `-q`, `--
 `--api-key`, `-y` are root-only, and a command that respells one is a bug. Two options are
 deliberately declared in both places, and neither is a duplicate to clean up:
 
-- **`-w/--workspace`**, via the shared `WorkspaceOpt` in `options.py`, on every `dataset` command
-  and `user list`. The command-level flag names the workspace for that invocation and
+- **`-w/--workspace`**, via the shared `WorkspaceOpt` in `options.py`, on every `dataset` and
+  `annotate` command and on `user list`. The command-level flag names the workspace for that invocation and
   `resolve_workspace_name` falls back to the root `-w` when it's absent, which is what makes both
   `argilla-cli -w nlp-lab dataset list` and `argilla-cli dataset download my-ds -w nlp-lab` work.
   Reuse `WorkspaceOpt` on a new workspace-scoped command rather than respelling the flag.
@@ -98,8 +99,9 @@ src/argilla_cli/
   resources.py       Lookups against the SDK that turn a missing resource into NotFoundError.
   file_io.py         Atomic writes and classified text reads.
   records_io.py      Record formats, JMESPath mapping, streaming reads/writes, spooling.
+  annotation_api.py  The annotator-grade /me endpoints the SDK never wrapped (`annotate` uses it).
   clients/           Lazy construction of the Argilla SDK client.
-  commands/          One module per group: config, workspace, dataset, user, server.
+  commands/          One module per group: config, workspace, dataset, annotate, user, server.
 tests/               pytest suite against a fake SDK, plus contract tests against the real one.
 ```
 
