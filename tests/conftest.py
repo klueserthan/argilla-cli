@@ -292,9 +292,14 @@ class FakeAPI:
         *,
         json: Any = None,
         status_code: int = 200,
+        text: str | None = None,
     ) -> None:
-        """Script the response for one ``(method, path)`` pair."""
-        self._routes[(method.upper(), path)] = (status_code, json)
+        """Script the response for one ``(method, path)`` pair.
+
+        ``text`` scripts a non-JSON body -- what a proxy answering with an
+        HTML login or error page looks like -- and wins over ``json``.
+        """
+        self._routes[(method.upper(), path)] = (status_code, json, text)
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -304,7 +309,9 @@ class FakeAPI:
                 404,
                 json={"detail": f"no route for {request.method} {request.url.path}"},
             )
-        status_code, payload = scripted
+        status_code, payload, text = scripted
+        if text is not None:
+            return httpx.Response(status_code, text=text)
         return httpx.Response(status_code, json=payload)
 
 

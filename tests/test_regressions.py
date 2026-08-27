@@ -24,7 +24,7 @@ from argilla_cli.errors import (
 )
 from argilla_cli.main import app
 
-from .conftest import FakeArgilla, FakeWorkspace
+from .conftest import FakeAPI, FakeArgilla, FakeWorkspace
 
 
 def test_b1_workspace_create_exists_ok_succeeds(
@@ -204,3 +204,50 @@ def _unexpected_workspace_factory(*args: object, **kwargs: object) -> FakeWorksp
     raise AssertionError(
         "workspace creation must not be attempted when it already exists"
     )
+
+
+def test_a_non_json_200_from_the_search_route_is_a_server_failure(
+    runner: CliRunner,
+    credentials: None,
+    fake_client: FakeArgilla,
+    fake_api: FakeAPI,
+) -> None:
+    """A proxy's HTML page behind `annotate next` must exit 11, not 1.
+
+    The seam parsed the search response with a bare ``response.json()``; the
+    decode error comes from the ``json`` module, which ``map_exception`` has
+    no reason to know, so it surfaced as the unclassified exit 1.
+    ``server_info`` already classifies this exact case as a server failure --
+    something that answers 200 with non-JSON is not the Argilla API.
+    """
+    dataset_id = fake_client.datasets("reviews", workspace="nlp-lab").id
+    fake_api.route(
+        "POST",
+        f"/api/v1/me/datasets/{dataset_id}/records/search",
+        text="<html>sign in</html>",
+    )
+
+    result = runner.invoke(app, ["annotate", "next", "reviews", "-w", "nlp-lab"])
+
+    assert result.exit_code == 11, result.output
+
+
+def test_a_non_json_200_from_the_record_route_is_a_server_failure(
+    runner: CliRunner,
+    credentials: None,
+    fake_client: FakeArgilla,
+    fake_api: FakeAPI,
+) -> None:
+    """The record lookup behind `annotate discard` has the same boundary."""
+    record_id = "22222222-2222-2222-2222-222222222222"
+    fake_api.route(
+        "GET",
+        f"/api/v1/records/{record_id}",
+        text="<html>gateway error</html>",
+    )
+
+    result = runner.invoke(
+        app, ["annotate", "discard", "reviews", record_id, "-w", "nlp-lab"]
+    )
+
+    assert result.exit_code == 11, result.output
