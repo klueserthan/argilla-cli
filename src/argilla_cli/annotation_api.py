@@ -20,6 +20,11 @@ transport:
   likewise open to any workspace member. The server binds the new response to
   the authenticated caller, which is why no user id is sent: the route that
   takes one is the admin-only bulk upsert.
+* ``GET /api/v1/records/{record_id}`` -- policy ``RecordPolicy.get``, again any
+  member of the record's dataset workspace. It is here because the response
+  route above names no dataset: its record id is global, so this is the only
+  way a caller can establish that a record id belongs to the dataset it
+  thinks it is annotating.
 
 These are the endpoints the web UI itself uses, so they are as stable as the
 annotation product is. That is the argument for hand-rolling them rather than
@@ -123,6 +128,24 @@ def search_my_records(
     items = payload.get("items") or []
     records = [item["record"] for item in items]
     return records, int(payload.get("total", len(records)))
+
+
+def get_record(client: Any, record_id: str) -> dict[str, Any]:
+    """Return one record by its server id, as the server's own JSON.
+
+    The payload's ``dataset_id`` is what callers are here for: every write
+    route in this module is addressed by record id alone, so nothing else
+    ties a record to the dataset a caller named.
+
+    A record id that exists nowhere answers 404, and one in a workspace the
+    key cannot reach answers 403 -- the handler loads the record before it
+    authorizes. Neither is classified here: ``map_exception`` has the last
+    word on the exit code, as everywhere else in this module.
+    """
+    response = _transport(client).get(f"/api/v1/records/{record_id}")
+    response.raise_for_status()
+    record: dict[str, Any] = response.json()
+    return record
 
 
 def submit_response(

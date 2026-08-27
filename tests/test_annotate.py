@@ -24,6 +24,10 @@ from .conftest import FakeAPI, FakeArgilla
 
 RECORD_ID = "22222222-2222-2222-2222-222222222222"
 
+#: A dataset the caller never named. The response endpoint is scoped to the
+#: record alone, so this is what a record id from the wrong dataset looks like.
+ANOTHER_DATASET_ID = "33333333-3333-3333-3333-333333333333"
+
 
 def _dataset_id(
     client: FakeArgilla, name: str = "reviews", workspace: str = "nlp-lab"
@@ -35,8 +39,36 @@ def _search_path(client: FakeArgilla) -> str:
     return f"/api/v1/me/datasets/{_dataset_id(client)}/records/search"
 
 
+def _record_path(record_id: str = RECORD_ID) -> str:
+    return f"/api/v1/records/{record_id}"
+
+
 def _responses_path(record_id: str = RECORD_ID) -> str:
     return f"/api/v1/records/{record_id}/responses"
+
+
+def _script_writable_record(
+    fake_api: FakeAPI,
+    client: FakeArgilla,
+    *,
+    dataset_id: str | None = None,
+) -> None:
+    """Script both calls a write makes: the record lookup, then the answer.
+
+    ``dataset_id`` defaults to the one `reviews` actually has, i.e. a record
+    that does belong to the dataset the command names.
+    """
+    fake_api.route(
+        "GET",
+        _record_path(),
+        json={
+            "id": RECORD_ID,
+            "dataset_id": dataset_id or _dataset_id(client),
+            "status": "pending",
+            "fields": {"text": "hello"},
+        },
+    )
+    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
 
 
 def _body(request: httpx.Request) -> dict[str, Any]:
@@ -245,7 +277,7 @@ def test_submit_sends_one_wrapped_value_per_answer(
     ``rating=4`` has to arrive as the number 4: a rating question rejects the
     string "4".
     """
-    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
+    _script_writable_record(fake_api, fake_client)
 
     result = runner.invoke(
         app,
@@ -280,7 +312,7 @@ def test_submit_splits_an_answer_on_the_first_equals_sign(
     fake_api: FakeAPI,
 ) -> None:
     """Free-text answers contain ``=``; only the first one is the separator."""
-    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
+    _script_writable_record(fake_api, fake_client)
 
     result = runner.invoke(
         app,
@@ -306,7 +338,7 @@ def test_submit_reports_what_it_answered(
     fake_client: FakeArgilla,
     fake_api: FakeAPI,
 ) -> None:
-    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
+    _script_writable_record(fake_api, fake_client)
 
     result = runner.invoke(
         app,
@@ -339,7 +371,7 @@ def test_submit_can_leave_the_response_as_a_draft(
     fake_client: FakeArgilla,
     fake_api: FakeAPI,
 ) -> None:
-    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
+    _script_writable_record(fake_api, fake_client)
 
     result = runner.invoke(
         app,
@@ -396,7 +428,7 @@ def test_submit_reads_answers_from_a_json_file(
     tmp_path: Any,
 ) -> None:
     """The way to answer several questions, including structured values."""
-    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
+    _script_writable_record(fake_api, fake_client)
     source = tmp_path / "answers.json"
     source.write_text(
         jsonlib.dumps({"label": "positive", "topics": ["a", "b"]}), encoding="utf-8"
@@ -430,7 +462,7 @@ def test_submit_reads_answers_from_stdin(
     fake_api: FakeAPI,
 ) -> None:
     """``--from -`` so an agent can pipe a response without a temp file."""
-    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
+    _script_writable_record(fake_api, fake_client)
 
     result = runner.invoke(
         app,
@@ -654,7 +686,8 @@ def test_submit_to_a_missing_record_is_not_found(
     fake_client: FakeArgilla,
     fake_api: FakeAPI,
 ) -> None:
-    fake_api.route("POST", _responses_path(), json={"detail": "gone"}, status_code=404)
+    """A record id nothing answers to fails on the lookup, before the write."""
+    fake_api.route("GET", _record_path(), json={"detail": "gone"}, status_code=404)
 
     result = runner.invoke(
         app,
@@ -671,6 +704,73 @@ def test_submit_to_a_missing_record_is_not_found(
     )
 
     assert result.exit_code == 12, result.output
+    assert [r.method for r in fake_api.requests] == ["GET"]
+
+
+def test_submit_looks_the_record_up_before_answering_it(
+    runner: CliRunner,
+    credentials: None,
+    fake_client: FakeArgilla,
+    fake_api: FakeAPI,
+) -> None:
+    """The lookup is what ties the record id to the dataset the caller named.
+
+    ``POST /api/v1/records/{id}/responses`` is scoped to the record alone, so
+    without it the dataset argument would not constrain the write at all.
+    """
+    _script_writable_record(fake_api, fake_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "annotate",
+            "submit",
+            "reviews",
+            RECORD_ID,
+            "-w",
+            "nlp-lab",
+            "--answer",
+            "label=positive",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [(r.method, r.url.path) for r in fake_api.requests] == [
+        ("GET", _record_path()),
+        ("POST", _responses_path()),
+    ]
+
+
+def test_submit_refuses_a_record_that_belongs_to_another_dataset(
+    runner: CliRunner,
+    credentials: None,
+    fake_client: FakeArgilla,
+    fake_api: FakeAPI,
+) -> None:
+    """Pairing one dataset's name with another's record id must not write.
+
+    The record endpoint is global: any record id in a workspace the key can
+    reach would otherwise be answered and reported as a success under the
+    named dataset.
+    """
+    _script_writable_record(fake_api, fake_client, dataset_id=ANOTHER_DATASET_ID)
+
+    result = runner.invoke(
+        app,
+        [
+            "annotate",
+            "submit",
+            "reviews",
+            RECORD_ID,
+            "-w",
+            "nlp-lab",
+            "--answer",
+            "label=positive",
+        ],
+    )
+
+    assert result.exit_code == 12, result.output
+    assert [r.method for r in fake_api.requests] == ["GET"]
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +785,7 @@ def test_discard_answers_with_a_discarded_status_and_no_values(
     fake_api: FakeAPI,
 ) -> None:
     """Discarding is an answer without content, so ``values`` is omitted."""
-    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
+    _script_writable_record(fake_api, fake_client)
 
     result = runner.invoke(
         app, ["annotate", "discard", "reviews", RECORD_ID, "-w", "nlp-lab"]
@@ -706,7 +806,7 @@ def test_discard_needs_no_confirmation(
     """Discarding sets the caller's own response; nothing shared is destroyed,
     so it is not gated behind ``confirm()`` -- and an agent working through a
     queue would deadlock on a prompt with no terminal to answer it."""
-    fake_api.route("POST", _responses_path(), json={"id": "x"}, status_code=201)
+    _script_writable_record(fake_api, fake_client)
 
     result = runner.invoke(
         app,
@@ -720,6 +820,42 @@ def test_discard_needs_no_confirmation(
         "record_id": RECORD_ID,
         "status": "discarded",
     }
+
+
+def test_discard_looks_the_record_up_before_answering_it(
+    runner: CliRunner,
+    credentials: None,
+    fake_client: FakeArgilla,
+    fake_api: FakeAPI,
+) -> None:
+    _script_writable_record(fake_api, fake_client)
+
+    result = runner.invoke(
+        app, ["annotate", "discard", "reviews", RECORD_ID, "-w", "nlp-lab"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [(r.method, r.url.path) for r in fake_api.requests] == [
+        ("GET", _record_path()),
+        ("POST", _responses_path()),
+    ]
+
+
+def test_discard_refuses_a_record_that_belongs_to_another_dataset(
+    runner: CliRunner,
+    credentials: None,
+    fake_client: FakeArgilla,
+    fake_api: FakeAPI,
+) -> None:
+    """Discard writes a response too, so it needs the same guard as submit."""
+    _script_writable_record(fake_api, fake_client, dataset_id=ANOTHER_DATASET_ID)
+
+    result = runner.invoke(
+        app, ["annotate", "discard", "reviews", RECORD_ID, "-w", "nlp-lab"]
+    )
+
+    assert result.exit_code == 12, result.output
+    assert [r.method for r in fake_api.requests] == ["GET"]
 
 
 def test_discard_on_an_unknown_dataset_is_not_found(

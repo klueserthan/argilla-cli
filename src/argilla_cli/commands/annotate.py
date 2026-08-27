@@ -40,9 +40,9 @@ from typing import Annotated, Any
 
 import typer
 
-from argilla_cli.annotation_api import search_my_records, submit_response
+from argilla_cli.annotation_api import get_record, search_my_records, submit_response
 from argilla_cli.context import ctx
-from argilla_cli.errors import ValidationError, handle_errors
+from argilla_cli.errors import NotFoundError, ValidationError, handle_errors
 from argilla_cli.file_io import read_text_file
 from argilla_cli.io_utils import print_ok, render
 from argilla_cli.options import LimitOpt, WorkspaceOpt, resolve_workspace_name
@@ -106,15 +106,34 @@ DatasetArg = Annotated[str, typer.Argument(help="Dataset name")]
 
 
 def _dataset_id(client: Any, name: str, workspace: str | None) -> tuple[Any, str]:
-    """Resolve the dataset, and return it with the server id to address it by.
-
-    The response endpoint needs only a record id, but the dataset is resolved
-    for `submit` and `discard` too: a mistyped dataset name has to stop here
-    with exit 12 rather than quietly answering a record that lives somewhere
-    else entirely.
-    """
+    """Resolve the dataset, and return it with the server id to address it by."""
     dataset = resolve_dataset(client, name, workspace)
     return dataset, str(getattr(dataset, "id", "") or "")
+
+
+def _writable_record(client: Any, record_id: str, name: str, dataset_id: str) -> None:
+    """Refuse to answer a record that is not in the dataset the caller named.
+
+    ``POST /api/v1/records/{record_id}/responses`` is scoped to the record
+    alone -- nothing in the request mentions a dataset. So without this
+    check the dataset argument would be decorative on a write, and pairing
+    dataset A's name with a record id from dataset B (any dataset in a
+    workspace the key can reach) would answer B's record and report success
+    under A's name. Reading is not exposed the same way: `next` addresses the
+    dataset itself, and the server picks the records.
+
+    A mismatch is a ``NotFoundError`` rather than a validation error because
+    that is what it is from the caller's stated intent -- there is no such
+    record in that dataset -- and it keeps one verdict for the whole
+    condition: a record id that exists nowhere already arrives here as the
+    lookup's own 404, which ``map_exception`` maps to the same exit 12.
+    """
+    record = get_record(client, record_id)
+    # Both sides are UUIDs that only ever meet as text; the SDK renders them
+    # lowercase and so does the API, but a case difference must not read as a
+    # different dataset.
+    if str(record.get("dataset_id", "")).lower() != dataset_id.lower():
+        raise NotFoundError(f"record {record_id} not found in dataset {name!r}")
 
 
 def _coerce(raw: str) -> Any:
@@ -270,7 +289,8 @@ def submit(
     # Validate the answers before the lookup so a malformed --answer is
     # reported without a round trip to the server.
     values = _answer_values(answer, source)
-    _dataset_id(client, name, resolve_workspace_name(workspace))
+    _, dataset_id = _dataset_id(client, name, resolve_workspace_name(workspace))
+    _writable_record(client, record_id, name, dataset_id)
 
     submit_response(client, record_id, values=values, status=status.value)
 
@@ -304,7 +324,8 @@ def discard(
         argilla-cli annotate discard my-ds <record-id> -w nlp-lab
     """
     client = ctx.client()
-    _dataset_id(client, name, resolve_workspace_name(workspace))
+    _, dataset_id = _dataset_id(client, name, resolve_workspace_name(workspace))
+    _writable_record(client, record_id, name, dataset_id)
 
     submit_response(client, record_id, values=None, status="discarded")
 

@@ -283,7 +283,10 @@ Notes:
   response and destroys nothing shared, and you can submit an answer
   afterwards to replace it.
 - A key without access to the dataset's workspace exits **10**; an unknown
-  dataset or record exits **12**.
+  dataset or record exits **12**. Argilla's record ids are global, so `submit`
+  and `discard` check that the record really is in the dataset you named
+  before writing anything — a record id from a *different* dataset exits
+  **12** too, rather than answering the other dataset's record.
 
 ### `user` — manage users
 

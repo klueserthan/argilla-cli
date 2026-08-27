@@ -20,7 +20,7 @@ import json as jsonlib
 import httpx
 import pytest
 
-from argilla_cli.annotation_api import search_my_records, submit_response
+from argilla_cli.annotation_api import get_record, search_my_records, submit_response
 from argilla_cli.errors import (
     AuthConfigError,
     NetworkApiError,
@@ -34,6 +34,7 @@ DATASET_ID = "11111111-1111-1111-1111-111111111111"
 RECORD_ID = "22222222-2222-2222-2222-222222222222"
 
 SEARCH_PATH = f"/api/v1/me/datasets/{DATASET_ID}/records/search"
+RECORD_PATH = f"/api/v1/records/{RECORD_ID}"
 RESPONSES_PATH = f"/api/v1/records/{RECORD_ID}/responses"
 
 A_SEARCH_RESULT = {
@@ -165,6 +166,43 @@ def test_an_empty_page_is_not_an_error(
     fake_api.route("POST", SEARCH_PATH, json={"items": [], "total": 0})
 
     assert search_my_records(fake_client, DATASET_ID, limit=5) == ([], 0)
+
+
+def test_fetching_a_record_asks_the_globally_scoped_record_route(
+    fake_client: FakeArgilla, fake_api: FakeAPI
+) -> None:
+    """``GET /api/v1/records/{id}``, which any workspace member may call.
+
+    The record id is global, so this is what tells a caller which dataset a
+    record actually belongs to -- the response route names none.
+    """
+    fake_api.route(
+        "GET",
+        RECORD_PATH,
+        json={"id": RECORD_ID, "dataset_id": DATASET_ID, "status": "pending"},
+    )
+
+    record = get_record(fake_client, RECORD_ID)
+
+    request = fake_api.requests[-1]
+    assert request.method == "GET"
+    assert request.url.path == RECORD_PATH
+    assert record["dataset_id"] == DATASET_ID
+
+
+def test_a_record_the_key_may_not_see_surfaces_as_a_classifiable_status_error(
+    fake_client: FakeArgilla, fake_api: FakeAPI
+) -> None:
+    """The handler loads the record before authorizing, so a record outside
+    the caller's workspaces answers 403 rather than 404."""
+    fake_api.route("GET", RECORD_PATH, json={"detail": "no"}, status_code=403)
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        get_record(fake_client, RECORD_ID)
+
+    mapped = map_exception(excinfo.value)
+    assert isinstance(mapped, AuthConfigError)
+    assert mapped.exit_code == 10
 
 
 def test_submitting_a_response_wraps_every_value(
