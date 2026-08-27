@@ -35,7 +35,12 @@ argilla-cli workspace add-user <workspace> agent-ra-1
 
 The operator then gives the agent a profile or environment pointed at that
 user's API key — `argilla-cli config set api_key <key> --profile agent-ra-1`,
-or `ARGILLA_API_URL`/`ARGILLA_API_KEY` in the environment. The **annotator**
+or `ARGILLA_API_URL`/`ARGILLA_API_KEY` in the environment. Note that
+`config set --profile` *writes* the named profile but does not select it:
+the agent's environment must also set `ARGILLA_CLI_PROFILE=agent-ra-1` (or
+every command must pass the root `-p agent-ra-1` flag), otherwise commands
+keep running under whatever profile was already current — potentially the
+operator's own admin or owner credentials. The **annotator**
 role is enforced server-side: that key can read datasets only in its
 assigned workspaces and submit its own responses. It cannot create, delete,
 or modify datasets or records, cannot write suggestions, and cannot see
@@ -62,7 +67,7 @@ expect, not a personal or admin account.
 
    ```bash
    argilla-cli dataset show <dataset> -w <workspace>
-   argilla-cli dataset settings <dataset> -w <workspace> -o json
+   argilla-cli -o json dataset settings <dataset> -w <workspace>
    ```
 
    `dataset show` gives the guidelines and question names. `dataset
@@ -76,7 +81,7 @@ expect, not a personal or admin account.
 2. **Fetch the next pending record(s):**
 
    ```bash
-   argilla-cli annotate next <dataset> -w <workspace> --limit 1 -o json
+   argilla-cli -o json annotate next <dataset> -w <workspace> --limit 1
    ```
 
    An empty result (empty list, exit 0) means the queue is empty — stop,

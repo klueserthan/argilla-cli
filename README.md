@@ -293,12 +293,19 @@ argilla-cli workspace add-user my-ws agent-ra-1
 argilla-cli config set api_key <agent-key> --profile agent-ra-1
 ```
 
+`config set --profile` writes the named profile but does not make it the
+current one — if the machine already had a profile, later commands keep
+using it, which could be your own admin or owner credentials. Select the
+annotator profile in the agent's environment with
+`ARGILLA_CLI_PROFILE=agent-ra-1` (or pass the root `-p agent-ra-1` flag on
+every command).
+
 Before annotating, the agent should confirm it's running as the intended
 identity:
 
 ```bash
-argilla-cli server health
-argilla-cli user me
+argilla-cli -p agent-ra-1 server health
+argilla-cli -p agent-ra-1 user me
 ```
 
 ### Command reference
