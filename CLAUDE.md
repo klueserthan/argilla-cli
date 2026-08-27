@@ -1,0 +1,255 @@
+# argilla-cli
+
+A production-quality command-line client for [Argilla](https://argilla.io): manage workspaces,
+users, datasets and records on an Argilla server from the terminal, and move records between
+that server, local files, and the Hugging Face Hub.
+
+Python 3.11+ (CI matrix: 3.11, 3.12, 3.13), a `src/` layout, packaged with setuptools and
+managed with **uv**. The console script is `argilla-cli` (`argilla_cli.main:run`). Built on
+typer + rich over the official `argilla` SDK.
+
+This is a *thin, well-behaved wrapper*, not a reimplementation: the SDK owns talking to the
+server, and this CLI owns everything the SDK leaves to the caller — credential resolution,
+error classification, exit codes, output formatting, and the atomicity/ordering guarantees that
+turn a half-finished command into a recoverable one.
+
+## Commands
+
+| group | commands |
+|---|---|
+| `config` | `show`, `doctor`, `list`, `set`, `get`, `use`, `remove` |
+| `workspace` | `list`, `show`, `create`, `delete`, `users`, `add-user`, `remove-user` |
+| `dataset` | `list`, `show`, `progress`, `create`, `delete`, `settings`, `download`, `push`, `copy`, `to-hub`, `from-hub` |
+| `user` | `me`, `list`, `show`, `create`, `delete`, `add-to-workspace`, `remove-from-workspace` |
+| `server` | `info`, `whoami`, `health` |
+
+Global flags are declared **once**, on the root callback in `main.py`:
+`-o/--output {table,json,yaml,csv}`, `-w/--workspace`, `-p/--profile`, `--api-url`, `--api-key`,
+`-y/--yes`, `-v/--verbose`, `-q/--quiet`, `-V/--version`. Commands read them off
+`argilla_cli.context.ctx` and `argilla_cli.io_utils`; they never redeclare their own copy.
+
+## Commands to run
+
+```bash
+uv sync --all-extras          # venv + package + hub/export extras + dev group
+uv run argilla-cli --help     # run against the checkout, no install step
+
+make check                    # mirrors CI exactly — run this before pushing
+make lint                     # uv run ruff check .
+make format                   # uv run ruff format .   (--check in CI)
+make typecheck                # uv run mypy src
+make test                     # uv run pytest --cov=argilla_cli --cov-report=term-missing
+make lock                     # uv lock
+make build                    # uv build (sdist + wheel)
+```
+
+Ruff: line length 88, `E,F,I,UP,B`, target `py311`. Mypy runs over `src` with
+`disallow_untyped_defs`, `check_untyped_defs`, `warn_unused_ignores`, and deliberately **no**
+pinned `python_version` (see the comment in `pyproject.toml` — pinning 3.11 while checking a
+3.12+ env makes it parse that env's stubs under the wrong rules).
+
+Dependencies go in via `uv add` / `uv add --optional <extra>` / `uv add --dev`, never by hand.
+`uv.lock` is committed and CI runs `uv sync --locked --all-extras`, so a lock change belongs in
+the same commit as the `pyproject.toml` change that caused it.
+
+## Layout
+
+```
+src/argilla_cli/
+  main.py            Typer app; every global flag declared once on the root callback.
+  context.py         Per-invocation connection state (profile, workspace, lazy SDK client).
+  io_utils.py        Presentation state (format/verbose/quiet) and the one render() entry point.
+  errors.py          Error taxonomy, exit codes, map_exception(), @handle_errors.
+  settings.py        Layered settings resolution with source tracking.
+  profiles.py        Persistent multi-server profile store (config.toml).
+  options.py         Reusable option/argument definitions and confirm().
+  resources.py       Lookups against the SDK that turn a missing resource into NotFoundError.
+  file_io.py         Atomic writes and classified text reads.
+  records_io.py      Record formats, JMESPath mapping, streaming reads/writes, spooling.
+  clients/           Lazy construction of the Argilla SDK client.
+  commands/          One module per group: config, workspace, dataset, user, server.
+tests/               pytest suite against a fake SDK, plus contract tests against the real one.
+```
+
+## Architecture
+
+### Settings resolution (`settings.py`, `profiles.py`)
+
+Precedence, highest first: **CLI flags → process environment → the selected profile in
+`config.toml` → a local `.env`**. `SettingsInfo.source_of(key)` remembers *which* layer won, so
+`config show` can name where every effective value actually came from (with secrets masked);
+`config doctor` then checks credentials, connectivity and the HF token, passing the original
+exception through so an auth failure still exits 10 and a transport failure 11.
+
+Resolution never raises for *missing* credentials — `config show`, the command whose whole job
+is diagnosing missing credentials, has to be able to run. Commands that need the server call
+`ctx.require_settings()` / `require_credentials()`, which is where `AuthConfigError` (exit 10)
+comes from.
+
+Profiles live at `$XDG_CONFIG_HOME/argilla-cli/config.toml` (overridable with
+`ARGILLA_CLI_CONFIG`, selectable with `ARGILLA_CLI_PROFILE` or `-p`), so one install can talk to
+several servers. Env vars still win over the file, so env-only setups keep working untouched.
+
+Environment variables: `ARGILLA_API_URL`, `ARGILLA_API_KEY`, `HF_TOKEN` (Hub commands only),
+`ARGILLA_DEFAULT_OUTPUT_DIR`, `ARGILLA_CLI_CONFIG`, `ARGILLA_CLI_PROFILE`, `XDG_CONFIG_HOME`.
+`.env.example` doubles as the reference — **update it whenever a variable is added.**
+
+### Errors and exit codes (`errors.py`) — part of the contract
+
+| code | meaning | exception |
+|---|---|---|
+| 0 | success | — |
+| 1 | unexpected / unclassified | `CLIError` |
+| 2 | usage error (bad flags, unsupported values) | `UsageError` |
+| 10 | authentication or configuration problem | `AuthConfigError` |
+| 11 | network or server-side failure | `NetworkApiError` |
+| 12 | resource not found | `NotFoundError` |
+| 13 | validation error / missing optional extra | `ValidationError`, `MissingExtraError` |
+
+`map_exception` classifies by **exception type and HTTP status only** — never by matching
+substrings against the message (an earlier version's bare `"5"` test reclassified anything whose
+text contained the digit as a network failure). The rules, in order:
+
+1. Already a `CLIError` → returned as-is.
+2. HTTP status, if one can be found on the exception or its `.response`. Every status from 300
+   up is assigned deliberately: 401/403→10, 404→12, 408/429/5xx→11, other 4xx→13, 3xx→11.
+   An **unclassifiable** status returns `None` and falls *through* rather than short-circuiting,
+   so the transport rules below still get their say.
+3. Transport module (`httpx`/`requests`/`urllib3`) or `ConnectionError`/`TimeoutError` → 11.
+4. `pydantic`/`pydantic_core` → 13 (a model rejecting user data locally is bad input).
+5. `argilla` → by exception name: credentials/unauthorized/forbidden→10, not-found→12, the
+   `_ARGILLA_VALIDATION_MARKERS` names→13, everything else→11.
+
+Every command body is wrapped in `@handle_errors`, which re-raises control-flow exceptions
+(`typer.Exit`, `typer.Abort`, `click.Abort`, `click.ClickException`) untouched — they subclass
+`RuntimeError`, and a hand-rolled `except Exception` swallows deliberate exits and rewrites
+documented exit codes. `functools.wraps` sets `__wrapped__`, which Typer follows to build the
+right CLI parameters. **Don't add your own try/except around a command body**: raise a typed
+error or let the exception propagate. Use `is_classified(exc)` before wrapping an exception in
+your own type, so you don't overwrite an auth or network verdict with something vaguer.
+
+### Output (`io_utils.py`)
+
+Every command that emits structured output calls `render()`, which honours the global
+`-o/--output` — so a new command supports table/json/yaml/csv without any per-command work.
+Never add a per-command `--json` flag. Table column order is first-seen key order (not
+alphabetical), so tables lead with the identifying column. `print_ok` is suppressed under
+`--quiet` *and* under any structured format (chatter must never contaminate machine-readable
+stdout); `print_error`/`print_warn` go to stderr and errors are never suppressed.
+
+Presentation state lives here rather than in `context.py` on purpose: `errors` needs to print
+and `context` needs to raise, so putting them together would create an import cycle.
+
+### The SDK seam (`clients/`, `resources.py`, `context.py`)
+
+`import argilla` pulls a large tree and costs noticeable startup time, so it happens **lazily
+inside functions** — `--help`, `config show` and shell completion stay fast and keep working
+even when the SDK can't be imported. `ctx.client()` looks `get_client` up *through the module*
+rather than importing it by name, which is what lets tests monkeypatch it in one place.
+
+The SDK's accessors return `None` for a missing resource instead of raising. Every lookup goes
+through `resources.py` so that becomes a clean `NotFoundError` (exit 12) rather than
+`'NoneType' object has no attribute 'delete'` with a generic exit 1.
+
+### Record I/O (`records_io.py`, `file_io.py`)
+
+Formats: JSONL (default), CSV (standard library — not routed through pandas), Parquet (needs
+the `export` extra; guarded by `MissingExtraError`, not a raw `ImportError`). `--map` applies a
+JMESPath expression per output field; `--list-policy` decides what container results collapse
+to, defaulting to `join` on export and **`preserve` on push**, because Argilla's structured
+properties (`fields`, `metadata`, `suggestions`, `vectors`) must arrive as mappings and lists.
+
+Guarantees the code exists to hold — treat them as invariants when editing:
+
+- **Reads are lazy, and `--limit N` stops at N.** Records are streamed by *iterating*
+  `dataset.records` (the narrowest SDK contract), and each local reader parses no further than
+  the limit. A limit must never become a post-filter over a full download.
+- **Nothing is uploaded until the whole input has been checked.** `dataset push` maps and
+  parses the entire stream, runs it through the SDK's own `_ingest_records` a batch at a time,
+  and *spools it to disk* (`spooled_records`) before the first upload — both the
+  fail-before-any-write property and the memory bound, which earlier versions had one of but
+  never both. A malformed row at 600 must not leave 500 rows on the server, especially since
+  `push` keeps ids so retrying an id-less input would duplicate them.
+- **Files are replaced atomically.** `atomic_path` writes to a temporary sibling (created 0o600,
+  which matters for the credential store) and `os.replace`s it — an interrupted export must not
+  destroy the previous good one, and a truncated `config.toml` must not lose every stored key.
+- **`dataset copy` rolls back.** The first batch is read *before* the destination is created, so
+  an unreadable source leaves nothing behind; anything failing later deletes the partial
+  dataset, guarding `BaseException` so a Ctrl+C mid-copy is covered too.
+- **Decode failures are classified.** `UnicodeDecodeError` subclasses `ValueError` and lives in
+  `builtins`, so it slips past both `except OSError` and `map_exception`. Read user-pointed text
+  through `read_text_file` so one bad byte exits 13, not 1.
+- **Private SDK API degrades, never crashes.** `_ingest_records` and the per-record flattener are
+  private; their absence downgrades the feature rather than erroring, and `test_sdk_contract`
+  fails loudly if they move.
+
+## Testing
+
+`pytest` from `tests/`, with `pythonpath = ["src"]` and `-q`. Coverage is reported but not
+gated.
+
+- **Everything runs against `FakeArgilla`** in `tests/conftest.py`, which mirrors the two SDK
+  behaviours the CLI has to get right: accessors are both iterable and callable
+  (`client.workspaces` / `client.workspaces("name")`), and a callable accessor returns `None`
+  for a missing resource instead of raising.
+- Two autouse fixtures do the heavy lifting: `isolated_env` strips every relevant env var,
+  chdirs into a tmp dir, points `XDG_CONFIG_HOME`/`ARGILLA_CLI_CONFIG` at it and resets the
+  `io_utils`/`ctx` singletons on both sides of the test; `patch_client` routes `ctx.client()` to
+  the fake. Neither an ambient `ARGILLA_API_KEY` nor a stray `.env` can leak into a result.
+- Commands are exercised end-to-end through Typer's `CliRunner`, asserting on **exit code** as
+  much as on output — the exit codes are the contract.
+- `tests/test_sdk_contract.py` is the exception: it introspects the *real* installed `argilla`
+  package (no server needed) so drift between the SDK and what the fake imitates fails here
+  rather than in the field. Add a case here whenever you start depending on a new SDK shape.
+- `tests/test_regressions.py` and `tests/test_review_fixes.py` pin previously-fixed bugs. When
+  you fix a behavioural bug, add its case there; when you change behaviour these cover, read the
+  test's docstring first — it usually records *why*.
+
+## House style
+
+- **Module docstrings carry the "why".** This codebase documents the constraint a module exists
+  to satisfy, and often the wrong version that came before it, at the top of the file. Match
+  that when adding one: explain the failure mode, not what the functions do.
+- **Same for non-obvious code.** Comments explain the alternative that was rejected and what it
+  broke (`BaseException` vs `Exception` in the copy rollback, spooling vs listing in push).
+  Don't strip them; extend them when the reasoning changes.
+- **One place per decision.** Exit-code mapping lives only in `errors.py`, rendering only in
+  `io_utils.render`, flag spelling only in `options.py`/`main.py`, resource lookup only in
+  `resources.py`. If you find yourself adding a second copy, move the first instead.
+- Commands stay thin: resolve inputs, call one or two helpers, `render()` the result.
+- `from __future__ import annotations` at the top of every module.
+
+### Adding a command
+
+1. Put it in the relevant `commands/<group>.py` (or create a group and register it with
+   `app.add_typer(...)` in `main.py`).
+2. Decorate with `@app.command("name")` **and** `@handle_errors`.
+3. Reuse options from `options.py` (`WorkspaceOpt`, `LimitOpt`, `resolve_workspace_name`,
+   `confirm`) rather than respelling a flag; no per-command `--json`/`--output`.
+4. Look resources up via `resources.py`; gate destructive actions behind `confirm()`.
+5. Emit through `render()` (and `print_ok` for the human-facing note).
+6. Guard optional dependencies with `MissingExtraError`, not a bare import.
+7. Add a test under `tests/`, asserting the exit code.
+8. Update `README.md` (the command reference) and `CONTRIBUTING.md` if the convention itself
+   changed.
+
+## Change workflow
+
+Every change goes through a pull request against `main`; don't commit or push directly to `main`
+unless the current request explicitly says to.
+
+- Branch from an up-to-date `main`, run `make check` locally before pushing — it runs exactly
+  what CI runs.
+- CI (`.github/workflows/ci.yml`) runs lint, format check, mypy, and pytest with coverage across
+  Python 3.11/3.12/3.13 with `uv sync --locked --all-extras`, plus a `build` job that runs
+  `uv build` and `twine check`. All of it must be green before merge.
+- Commit subjects are imperative and describe the outcome ("Validate the whole push input before
+  uploading any of it"), not the mechanics.
+- Never commit API keys, HF tokens, or `.env` contents.
+
+## Documentation
+
+- `README.md` — install, configuration, the full command reference, exit codes. Update it in the
+  same PR whenever the command surface or a flag changes.
+- `CONTRIBUTING.md` — dev loop, dependency management, project layout, command conventions.
+- `.env.example` — the environment-variable reference; update it when a variable is added.
