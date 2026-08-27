@@ -34,7 +34,7 @@ Global flags are declared **once**, on the root callback in `main.py`:
 uv sync --all-extras          # venv + package + hub/export extras + dev group
 uv run argilla-cli --help     # run against the checkout, no install step
 
-make check                    # mirrors CI exactly — run this before pushing
+make check                    # the CI test job's four steps, on one interpreter
 make lint                     # uv run ruff check .
 make format                   # uv run ruff format .   (--check in CI)
 make typecheck                # uv run mypy src
@@ -42,6 +42,19 @@ make test                     # uv run pytest --cov=argilla_cli --cov-report=ter
 make lock                     # uv lock
 make build                    # uv build (sdist + wheel)
 ```
+
+`make check` runs the same four commands as CI's test job — ruff check, ruff format --check,
+mypy, pytest — but only on the interpreter your venv is built against. It does **not** cover two
+things CI does, so a green `make check` is necessary rather than sufficient:
+
+- the **3.11/3.12/3.13 matrix** — run `UV_PYTHON=3.11 make check` (and 3.13) when a change could
+  be version-sensitive;
+- the **build job** — `uv build` and `twine check dist/*`, worth running by hand when packaging
+  metadata changes.
+
+It also assumes your venv is already synced with `--all-extras`. CI runs
+`uv sync --locked --all-extras`, so a venv missing the `hub` extra fails mypy on `jinja2` locally
+while CI is green — sync first rather than chasing the error.
 
 Ruff: line length 88, `E,F,I,UP,B`, target `py311`. Mypy runs over `src` with
 `disallow_untyped_defs`, `check_untyped_defs`, `warn_unused_ignores`, and deliberately **no**
@@ -161,9 +174,14 @@ properties (`fields`, `metadata`, `suggestions`, `vectors`) must arrive as mappi
 
 Guarantees the code exists to hold — treat them as invariants when editing:
 
-- **Reads are lazy, and `--limit N` stops at N.** Records are streamed by *iterating*
-  `dataset.records` (the narrowest SDK contract), and each local reader parses no further than
-  the limit. A limit must never become a post-filter over a full download.
+- **Reads are lazy, and `--limit N` stops at N — except for Parquet.** Server-side records are
+  streamed by *iterating* `dataset.records` (the narrowest SDK contract), so `--limit` on a
+  download must never become a post-filter over a full download. The JSONL and CSV readers
+  likewise decode no more rows than the limit calls for. **Parquet is the documented exception**:
+  it is columnar and can't be streamed by row, so `_iter_parquet` materialises the whole file
+  through pandas and the limit only bounds what is passed onward — memory scales with the file,
+  and a malformed row past the limit still surfaces. Don't write a test or a change that assumes
+  otherwise; the answer for input too large to hold is JSONL, which streams end to end.
 - **Nothing is uploaded until the whole input has been checked.** `dataset push` maps and
   parses the entire stream, runs it through the SDK's own `_ingest_records` a batch at a time,
   and *spools it to disk* (`spooled_records`) before the first upload — both the
@@ -275,8 +293,8 @@ gated.
 Every change goes through a pull request against `main`; don't commit or push directly to `main`
 unless the current request explicitly says to.
 
-- Branch from an up-to-date `main`, run `make check` locally before pushing — it runs exactly
-  what CI runs.
+- Branch from an up-to-date `main`, and run `make check` locally before pushing — the CI test
+  job's four steps on one interpreter (see **Commands to run** for what it leaves out).
 - CI (`.github/workflows/ci.yml`) runs lint, format check, mypy, and pytest with coverage across
   Python 3.11/3.12/3.13 with `uv sync --locked --all-extras`, plus a `build` job that runs
   `uv build` and `twine check`. All of it must be green before merge.
