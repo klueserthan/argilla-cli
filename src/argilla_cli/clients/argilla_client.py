@@ -49,7 +49,7 @@ def check_connectivity(client: Any) -> tuple[bool, Exception | None]:
         return False, exc
 
 
-def _http_transport(client: Any) -> Any | None:
+def http_transport(client: Any) -> Any | None:
     """Locate the SDK's HTTP client.
 
     ``APIClient.__init__`` sets ``self.http_client`` and then builds
@@ -95,7 +95,7 @@ def _more_informative(candidate: Exception, incumbent: Exception | None) -> bool
 
 def server_info(client: Any) -> dict[str, Any]:
     """Fetch server version/status via the SDK's underlying HTTP client."""
-    http = _http_transport(client)
+    http = http_transport(client)
     if http is None:
         raise NetworkApiError("client does not expose an HTTP transport")
 
