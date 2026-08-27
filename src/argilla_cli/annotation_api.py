@@ -93,6 +93,22 @@ def _transport(client: Any) -> Any:
     return http
 
 
+def _json_payload(response: Any, path: str) -> Any:
+    """Decode a 200 body, classifying non-JSON as a server failure.
+
+    A 200 whose body is not JSON means something answered that is not the
+    Argilla API -- typically a proxy serving an HTML login or error page.
+    The decode error itself comes from the ``json`` module, which
+    ``map_exception`` has no reason to know, so left bare it reached the
+    unclassified exit 1. ``server_info`` classifies this same boundary the
+    same way: a server that responds with nonsense is a server problem, 11.
+    """
+    try:
+        return response.json()
+    except Exception as exc:
+        raise NetworkApiError(f"{path} did not return JSON: {exc}") from exc
+
+
 def search_my_records(
     client: Any,
     dataset_id: str,
@@ -117,13 +133,14 @@ def search_my_records(
         # has to be an absent key rather than an empty list.
         query["filters"] = {"and": [_pending_filter()]}
 
+    path = f"/api/v1/me/datasets/{dataset_id}/records/search"
     response = _transport(client).post(
-        f"/api/v1/me/datasets/{dataset_id}/records/search",
+        path,
         json=query,
         params={"offset": offset, "limit": limit, "include": SEARCH_INCLUDE},
     )
     response.raise_for_status()
-    payload = response.json()
+    payload = _json_payload(response, path)
 
     items = payload.get("items") or []
     records = [item["record"] for item in items]
@@ -142,9 +159,10 @@ def get_record(client: Any, record_id: str) -> dict[str, Any]:
     authorizes. Neither is classified here: ``map_exception`` has the last
     word on the exit code, as everywhere else in this module.
     """
-    response = _transport(client).get(f"/api/v1/records/{record_id}")
+    path = f"/api/v1/records/{record_id}"
+    response = _transport(client).get(path)
     response.raise_for_status()
-    record: dict[str, Any] = response.json()
+    record: dict[str, Any] = _json_payload(response, path)
     return record
 
 
