@@ -26,7 +26,15 @@ turn a half-finished command into a recoverable one.
 Global flags are declared **once**, on the root callback in `main.py`:
 `-o/--output {table,json,yaml,csv}`, `-w/--workspace`, `-p/--profile`, `--api-url`, `--api-key`,
 `-y/--yes`, `-v/--verbose`, `-q/--quiet`, `-V/--version`. Commands read them off
-`argilla_cli.context.ctx` and `argilla_cli.io_utils`; they never redeclare their own copy.
+`argilla_cli.context.ctx` and `argilla_cli.io_utils` rather than redeclaring their own copy.
+
+**One deliberate exception**: `config set` and `config get` declare their own `--profile`, and it
+is not a duplicate of the global one. The root `-p/--profile` picks the profile settings are
+*read from*; the local one picks the profile a value is *written to* or read out of, which is why
+`config set api_key ... --profile staging` works while the global flag stays free to mean
+something else. They compose rather than collide — `_target_profile` falls back to `ctx.profile`
+when the local flag is absent, then to `$ARGILLA_CLI_PROFILE`, then to the current profile. Don't
+"clean this up" by deleting the local option; it would break a supported invocation.
 
 ## Commands to run
 
@@ -322,10 +330,18 @@ This applies to agents as much as to people. In particular, file one when you:
   is a reason to write it down, not a reason to stay quiet.
 
 Use the templates: `.github/ISSUE_TEMPLATE/bug_report.yml` for bugs,
-`.github/ISSUE_TEMPLATE/enhancement.yml` for proposals. Both apply **`needs-triage`** on top of
-`bug`/`enhancement` — leave it on; a human removes it when the issue has been triaged. Search
-open issues for a duplicate first, and never paste a real `ARGILLA_API_KEY` or `HF_TOKEN` into an
-issue: redact them from any command line, log, or config you quote.
+`.github/ISSUE_TEMPLATE/enhancement.yml` for proposals. Search open issues for a duplicate first,
+and never paste a real `ARGILLA_API_KEY` or `HF_TOKEN` into an issue: redact them from any
+command line, log, or config you quote.
+
+Both forms also list **`needs-triage`** alongside `bug`/`enhancement`, so a new issue arrives
+flagged for triage and a human clears the label once they've looked at it. **This only takes
+effect once the label exists in the repo** — GitHub silently drops a label an issue form names
+but the repository doesn't have, rather than creating it. At the time of writing `bug` and
+`enhancement` exist and `needs-triage` does not, so it needs creating once under Issues → Labels;
+until then issues file with the other label only, and nothing else changes. If you find yourself
+reading this and the label is still missing, that is the one-click fix — not a reason to edit the
+templates.
 
 A good bug report here names the command, the exit code you got and the one you expected, and the
 smallest input that reproduces it. When you can, include the failing test — the report is more
