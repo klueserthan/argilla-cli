@@ -308,6 +308,91 @@ argilla-cli server whoami
 argilla-cli server health
 ```
 
+## Agent annotators
+
+argilla-cli can be run by an AI agent holding an Argilla API key with the
+**annotator** role, working through a dataset's queue the same way a human
+research assistant would: `annotate next` to fetch the next pending
+record, `annotate submit` to record a response, `annotate discard` for a
+record that cannot be judged. These commands are built on the server's
+`/api/v1/me/...` endpoints, so they behave identically regardless of
+whether the calling key belongs to an annotator, an admin, or an owner —
+what changes is what the server lets that key see and do.
+
+### Security model
+
+The annotator role is enforced **server-side**, not by this CLI — an
+annotator key can only read datasets in its assigned workspaces and submit
+its own responses to records in those datasets. It cannot create, delete,
+or modify datasets or records, cannot write suggestions, and cannot see
+other annotators' responses. Handing an agent an annotator-scoped key
+rather than an admin or owner key means a misbehaving or compromised agent
+is bounded to exactly what a human RA in that role could do.
+
+Multiple annotators — human RAs and agents alike — can work the same
+dataset concurrently. Argilla's task distribution settings decide how many
+responses a record needs before it counts as completed; once that
+threshold is met, the server removes the record from every remaining
+annotator's queue automatically. Nothing in this CLI coordinates that —
+it's a property of the server.
+
+### Setting up an agent annotator
+
+```bash
+# create a dedicated annotator user for the agent (not a shared/personal key)
+argilla-cli user create agent-ra-1 --role annotator --first-name "Agent RA"
+
+# give it access to the dataset's workspace
+argilla-cli workspace add-user my-ws agent-ra-1
+
+# point the agent's profile (or environment) at that user's API key
+argilla-cli config set api_key <agent-key> --profile agent-ra-1
+```
+
+`config set --profile` writes the named profile but does not make it the
+current one — if the machine already had a profile, later commands keep
+using it, which could be your own admin or owner credentials. Select the
+annotator profile in the agent's environment with
+`ARGILLA_CLI_PROFILE=agent-ra-1` (or pass the root `-p agent-ra-1` flag on
+every command).
+
+Before annotating, the agent should confirm it's running as the intended
+identity:
+
+```bash
+argilla-cli -p agent-ra-1 server health
+argilla-cli -p agent-ra-1 user me
+```
+
+### Command reference
+
+```bash
+argilla-cli annotate next my-ds -w my-ws --limit 1        # next pending record(s)
+argilla-cli annotate submit my-ds <record-id> -w my-ws \
+  --answer question_name=value                            # repeatable --answer
+argilla-cli annotate submit my-ds <record-id> -w my-ws \
+  --from response.json --status draft                     # complex response, or unsure
+argilla-cli annotate discard my-ds <record-id> -w my-ws    # record is unjudgeable
+```
+
+`--answer key=value` values that parse as JSON are sent structured;
+anything else is sent as a string. `--from file.json` (or `--from -` for
+stdin) is the alternative to repeated `--answer` for a multi-question
+response. `--status` defaults to `submitted`; pass `--status draft` when
+the agent is not confident enough to commit an answer, so a human reviewer
+sees it before it counts as a submitted judgment. An empty `annotate next`
+result (exit 0) means the queue is empty.
+
+### The `ra-annotator` skill
+
+[`skills/ra-annotator/SKILL.md`](./skills/ra-annotator/SKILL.md) packages
+the working loop above as a Claude Code agent skill: read a dataset's
+guidelines and question schema once (`dataset show`, `dataset settings`),
+then loop `annotate next` → judge the record against the guidelines →
+`annotate submit`/`discard` until the queue is empty, with guardrails
+against fabricating label values and an exit-code table for what to do on
+each failure mode.
+
 ## Exit codes
 
 | Code | Meaning |
