@@ -25,7 +25,8 @@ file for you.
 
 3. **Make your change.**
 
-4. **Run the full check suite before pushing** — it mirrors CI exactly:
+4. **Run the full check suite before pushing** — it runs the same four commands as CI's
+   test job, on your interpreter only:
 
    ```bash
    make check
@@ -35,6 +36,11 @@ file for you.
    and `pytest` with coverage. Individual targets (`make lint`, `make
    format`, `make typecheck`, `make test`) are also available; see `make
    help` for the full list.
+
+   CI runs those same steps across Python 3.11, 3.12 and 3.13 and adds a
+   separate build job (`uv build` + `twine check`), so a green `make check`
+   is necessary but not sufficient. Use `UV_PYTHON=3.11 make check` to check
+   another interpreter.
 
 5. Open a PR. CI runs the same matrix across Python 3.11, 3.12, and 3.13.
 

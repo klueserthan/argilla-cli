@@ -1,0 +1,84 @@
+name: Enhancement
+description: Propose a new command, flag, or change to existing behaviour.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: |
+        What can't you do today, or what is awkward? Describe the situation,
+        not the solution — the proposal is the next field.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: |
+        What should the CLI do instead? If it's a new command or flag, show the
+        invocation you'd want to type.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Select all that would change.
+      multiple: true
+      options:
+        - Configuration / profiles / credentials
+        - Errors and exit codes
+        - Output formatting (table/json/yaml/csv)
+        - dataset commands
+        - Record I/O (formats, --map, --limit)
+        - Hugging Face Hub integration
+        - workspace or user commands
+        - server commands
+        - Packaging / install / extras
+        - Docs
+    validations:
+      required: true
+
+  - type: dropdown
+    id: contract
+    attributes:
+      label: Does this change the user-facing contract?
+      description: |
+        The command surface and the exit codes are what scripts depend on, so a
+        breaking change needs a migration story.
+      options:
+        - "No — internal only"
+        - "Yes — additive (new command, new optional flag, new output field)"
+        - "Yes — breaking (renamed or removed command/flag, changed exit code or output shape)"
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dependencies
+    attributes:
+      label: Would this need a new dependency?
+      description: |
+        Optional features belong behind an extra (`hub`, `export`) and must be
+        guarded with `MissingExtraError`, not a bare import.
+      options:
+        - "No"
+        - "Yes — in an existing optional extra"
+        - "Yes — a new runtime dependency"
+        - Not sure
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else would solve the problem, and why is the proposal better?
+
+  - type: checkboxes
+    id: offer
+    attributes:
+      label: Implementation
+      options:
+        - label: I'm willing to open a PR for this.
