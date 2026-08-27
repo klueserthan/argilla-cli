@@ -1,0 +1,116 @@
+name: Bug report
+description: A command behaves incorrectly, exits with the wrong code, or produces the wrong output.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Never paste a real `ARGILLA_API_KEY` or `HF_TOKEN`** —
+        redact them from any command line, log, or config you quote.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences on what goes wrong.
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The exact invocation, with secrets redacted.
+      placeholder: argilla-cli dataset download my-ds -w nlp-lab --fmt csv
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where does the bug live? Select all that apply, or "Not sure".
+      multiple: true
+      options:
+        - Configuration / profiles / credentials
+        - Errors and exit codes
+        - Output formatting (table/json/yaml/csv)
+        - dataset — download / push / copy
+        - dataset — create / settings / progress
+        - Hugging Face Hub (to-hub / from-hub)
+        - workspace or user commands
+        - server commands
+        - Packaging / install / extras
+        - Docs (README, CONTRIBUTING, CLAUDE.md)
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The smallest input that shows the problem. If a local file is involved,
+        a few representative rows are more useful than the whole file.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: Include the exit code you expected, if that's part of it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead, including the exit code you got.
+    validations:
+      required: true
+
+  - type: input
+    id: exit_code
+    attributes:
+      label: Exit code
+      description: |
+        `echo $?` after the command. The codes are part of the CLI's contract:
+        0 success · 1 unclassified · 2 usage · 10 auth/config · 11 network ·
+        12 not found · 13 validation.
+      placeholder: "1"
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: |
+        The error message, ideally re-run with `-v/--verbose` so the underlying
+        exception is included. Redact tokens and URLs you'd rather not share.
+      render: text
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      value: |
+        - argilla-cli version (`argilla-cli --version`):
+        - Python:
+        - argilla SDK version:
+        - Argilla server version (`argilla-cli server info`):
+        - Extras installed (hub / export / neither):
+        - OS:
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for a duplicate.
+          required: true
+        - label: This report contains no API keys or HF tokens.
+          required: true

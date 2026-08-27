@@ -183,7 +183,40 @@ Guarantees the code exists to hold — treat them as invariants when editing:
   private; their absence downgrades the feature rather than erroring, and `test_sdk_contract`
   fails loudly if they move.
 
-## Testing
+## Testing: this repo is test-driven
+
+**Write the failing test first, then the code that makes it pass.** Every behavioural change —
+a new command, a new flag, a bug fix, a changed exit code, a new record format — starts with a
+test that fails for the right reason. Don't write the implementation ahead of its test, and
+don't retro-fit tests onto code that already works.
+
+"Fails for the right reason" is a real check here, not a formality. A CLI test that runs a
+command that doesn't exist yet exits **2** (usage error) — which is a failure, but not *your*
+failure. Read the assertion output before writing any implementation: it should be failing on
+the behaviour you're adding, not on Typer rejecting an unknown command or on a fixture that
+doesn't exist yet.
+
+The loop:
+
+1. Pick the file the change belongs in — `tests/test_<group>.py` for a command, `test_config.py`
+   for settings/profiles, `test_records_io.py` for record I/O, `test_render.py` for output,
+   `test_regressions.py` for a bug you are fixing, `test_sdk_contract.py` for a new assumption
+   about the SDK.
+2. Write the test. Assert the **exit code** first and the output second.
+3. Run just that test (`uv run pytest tests/test_dataset.py -k my_case`) and read the failure.
+4. Implement the smallest change that makes it pass.
+5. `make check` before pushing.
+
+Where a change needs a server behaviour the fake doesn't have yet, extend `FakeArgilla` in
+`conftest.py` as part of the same commit — and if you are extending it because the *real* SDK
+does something the fake didn't model, add the corresponding case to `test_sdk_contract.py` so
+the fake can't drift back out of line silently.
+
+Bug fixes get two things, in this order: a test in `test_regressions.py` that reproduces the bug
+and fails, then the fix. A bug that was worth fixing is worth pinning — most of this repo's
+existing suite is exactly that.
+
+### Conventions the suite already follows
 
 `pytest` from `tests/`, with `pythonpath = ["src"]` and `-q`. Coverage is reported but not
 gated.
@@ -221,16 +254,20 @@ gated.
 
 ### Adding a command
 
-1. Put it in the relevant `commands/<group>.py` (or create a group and register it with
+1. **Write the test first**, in `tests/test_<group>.py`: invoke it through `CliRunner`, assert
+   the exit code and the output. Run it, and confirm it fails on the behaviour rather than on
+   Typer not knowing the command.
+2. Put the command in the relevant `commands/<group>.py` (or create a group and register it with
    `app.add_typer(...)` in `main.py`).
-2. Decorate with `@app.command("name")` **and** `@handle_errors`.
-3. Reuse options from `options.py` (`WorkspaceOpt`, `LimitOpt`, `resolve_workspace_name`,
+3. Decorate with `@app.command("name")` **and** `@handle_errors`.
+4. Reuse options from `options.py` (`WorkspaceOpt`, `LimitOpt`, `resolve_workspace_name`,
    `confirm`) rather than respelling a flag; no per-command `--json`/`--output`.
-4. Look resources up via `resources.py`; gate destructive actions behind `confirm()`.
-5. Emit through `render()` (and `print_ok` for the human-facing note).
-6. Guard optional dependencies with `MissingExtraError`, not a bare import.
-7. Add a test under `tests/`, asserting the exit code.
-8. Update `README.md` (the command reference) and `CONTRIBUTING.md` if the convention itself
+5. Look resources up via `resources.py`; gate destructive actions behind `confirm()`.
+6. Emit through `render()` (and `print_ok` for the human-facing note).
+7. Guard optional dependencies with `MissingExtraError`, not a bare import.
+8. Extend `FakeArgilla` if the command needs server behaviour the fake lacks — and pin the real
+   SDK shape in `test_sdk_contract.py` if that's why.
+9. Update `README.md` (the command reference) and `CONTRIBUTING.md` if the convention itself
    changed.
 
 ## Change workflow
@@ -243,9 +280,38 @@ unless the current request explicitly says to.
 - CI (`.github/workflows/ci.yml`) runs lint, format check, mypy, and pytest with coverage across
   Python 3.11/3.12/3.13 with `uv sync --locked --all-extras`, plus a `build` job that runs
   `uv build` and `twine check`. All of it must be green before merge.
+- Fill in `.github/pull_request_template.md` rather than leaving it as-is, and link the issue the
+  work came from (`Closes #<n>`) when there is one.
 - Commit subjects are imperative and describe the outcome ("Validate the whole push input before
   uploading any of it"), not the mechanics.
 - Never commit API keys, HF tokens, or `.env` contents.
+
+## Filing issues
+
+**Open an issue for every bug you encounter, proactively — including ones you find in passing
+and are not fixing right now.** An unreported bug found while doing something else is lost the
+moment the session ends; the cost of filing is a minute, and the cost of not filing is finding it
+again from a user report.
+
+This applies to agents as much as to people. In particular, file one when you:
+
+- find a bug while working on something unrelated (don't widen your current change to fix it —
+  file it, and mention the issue number in your PR if it's adjacent);
+- have to work around incorrect behaviour to get your actual task done;
+- notice the code and its documented contract disagree (a wrong exit code, a flag that doesn't do
+  what `README.md` says, an invariant in this file that the code no longer holds);
+- hit a failure you decide is out of scope, blocked, or not worth fixing now — "not fixing this"
+  is a reason to write it down, not a reason to stay quiet.
+
+Use the templates: `.github/ISSUE_TEMPLATE/bug_report.yml` for bugs,
+`.github/ISSUE_TEMPLATE/enhancement.yml` for proposals. Both apply **`needs-triage`** on top of
+`bug`/`enhancement` — leave it on; a human removes it when the issue has been triaged. Search
+open issues for a duplicate first, and never paste a real `ARGILLA_API_KEY` or `HF_TOKEN` into an
+issue: redact them from any command line, log, or config you quote.
+
+A good bug report here names the command, the exit code you got and the one you expected, and the
+smallest input that reproduces it. When you can, include the failing test — the report is more
+useful than the prose, and it's the first thing the fix will need anyway.
 
 ## Documentation
 
@@ -253,3 +319,5 @@ unless the current request explicitly says to.
   same PR whenever the command surface or a flag changes.
 - `CONTRIBUTING.md` — dev loop, dependency management, project layout, command conventions.
 - `.env.example` — the environment-variable reference; update it when a variable is added.
+- `.github/pull_request_template.md`, `.github/ISSUE_TEMPLATE/` — the PR and issue forms. Keep the
+  checklists in step with this file when a convention changes.
