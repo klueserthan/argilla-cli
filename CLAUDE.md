@@ -28,13 +28,24 @@ Global flags are declared **once**, on the root callback in `main.py`:
 `-y/--yes`, `-v/--verbose`, `-q/--quiet`, `-V/--version`. Commands read them off
 `argilla_cli.context.ctx` and `argilla_cli.io_utils` rather than redeclaring their own copy.
 
-**One deliberate exception**: `config set` and `config get` declare their own `--profile`, and it
-is not a duplicate of the global one. The root `-p/--profile` picks the profile settings are
-*read from*; the local one picks the profile a value is *written to* or read out of, which is why
-`config set api_key ... --profile staging` works while the global flag stays free to mean
-something else. They compose rather than collide — `_target_profile` falls back to `ctx.profile`
-when the local flag is absent, then to `$ARGILLA_CLI_PROFILE`, then to the current profile. Don't
-"clean this up" by deleting the local option; it would break a supported invocation.
+That rule is about *presentation and connection* state — `-o`, `-v`, `-q`, `--api-url`,
+`--api-key`, `-y` are root-only, and a command that respells one is a bug. Two options are
+deliberately declared in both places, and neither is a duplicate to clean up:
+
+- **`-w/--workspace`**, via the shared `WorkspaceOpt` in `options.py`, on every `dataset` command
+  and `user list`. The command-level flag names the workspace for that invocation and
+  `resolve_workspace_name` falls back to the root `-w` when it's absent, which is what makes both
+  `argilla-cli -w nlp-lab dataset list` and `argilla-cli dataset download my-ds -w nlp-lab` work.
+  Reuse `WorkspaceOpt` on a new workspace-scoped command rather than respelling the flag.
+- **`--profile`**, on `config set` and `config get` only, where it means something *different*
+  from the root flag: `-p/--profile` picks the profile settings are read *from*, the local one
+  picks the profile a value is written *to* or read out of. That's what lets
+  `config set api_key ... --profile staging` work while the global flag stays free to mean
+  something else; `_target_profile` falls back to `ctx.profile`, then `$ARGILLA_CLI_PROFILE`,
+  then the current profile.
+
+Deleting either local option would break a supported invocation. What stays banned is a
+per-command `--json`/`--output` or a second spelling of a flag `options.py` already owns.
 
 ## Commands to run
 
@@ -182,14 +193,24 @@ properties (`fields`, `metadata`, `suggestions`, `vectors`) must arrive as mappi
 
 Guarantees the code exists to hold — treat them as invariants when editing:
 
-- **Reads are lazy, and `--limit N` stops at N — except for Parquet.** Server-side records are
-  streamed by *iterating* `dataset.records` (the narrowest SDK contract), so `--limit` on a
-  download must never become a post-filter over a full download. The JSONL and CSV readers
-  likewise decode no more rows than the limit calls for. **Parquet is the documented exception**:
-  it is columnar and can't be streamed by row, so `_iter_parquet` materialises the whole file
-  through pandas and the limit only bounds what is passed onward — memory scales with the file,
-  and a malformed row past the limit still surfaces. Don't write a test or a change that assumes
-  otherwise; the answer for input too large to hold is JSONL, which streams end to end.
+- **Reads are lazy, and `--limit N` stops at N.** Server-side records are streamed by *iterating*
+  `dataset.records` (the narrowest SDK contract), so `--limit` on a download must never become a
+  post-filter over a full download. How tightly the local readers hold that line differs by
+  format, and the differences are deliberate — check which one you're relying on before writing a
+  test against it:
+  - **JSONL is byte-exact.** `_iter_jsonl` opens the file in *binary* and decodes one line at a
+    time, precisely so an undecodable byte past the limit is never touched. A text handle would
+    decode a whole buffer per read and raise while fetching line 1. Keep it binary.
+  - **CSV is row-exact, not byte-exact.** `csv.DictReader` requires a text handle, so decoding
+    happens in buffer-sized chunks: `islice` parses exactly `limit` rows and no more, but a bad
+    byte anywhere in the first chunk surfaces even at `--limit 1`. That's a `ValidationError`
+    (exit 13) either way — `_iter_csv`'s own note about `line_num` locating "the region rather
+    than the exact line" is the same fact.
+  - **Parquet is eager.** It's columnar and can't be streamed by row, so `_iter_parquet`
+    materialises the whole file through pandas and the limit only bounds what is passed onward:
+    memory scales with the file, and a malformed row past the limit still surfaces.
+
+  The answer for input too large to hold is JSONL, which streams end to end.
 - **Nothing is uploaded until the whole input has been checked.** `dataset push` maps and
   parses the entire stream, runs it through the SDK's own `_ingest_records` a batch at a time,
   and *spools it to disk* (`spooled_records`) before the first upload — both the
