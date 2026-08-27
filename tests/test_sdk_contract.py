@@ -153,7 +153,7 @@ def test_client_exposes_the_http_transport_directly() -> None:
 
 def test_transport_lookup_finds_either_location() -> None:
     """The lookup tolerates the transport moving under `client.api`."""
-    from argilla_cli.clients.argilla_client import _http_transport
+    from argilla_cli.clients.argilla_client import http_transport
 
     class Direct:
         http_client = "transport"
@@ -165,9 +165,9 @@ def test_transport_lookup_finds_either_location() -> None:
     class Neither:
         pass
 
-    assert _http_transport(Direct()) == "transport"
-    assert _http_transport(ViaApi()) == "transport"
-    assert _http_transport(Neither()) is None
+    assert http_transport(Direct()) == "transport"
+    assert http_transport(ViaApi()) == "transport"
+    assert http_transport(Neither()) is None
 
 
 def test_log_validates_every_record_before_uploading_any() -> None:
@@ -196,6 +196,84 @@ def test_ingestion_hook_is_available_for_the_early_shape_check() -> None:
     from argilla.records._dataset_records import DatasetRecords
 
     assert callable(getattr(DatasetRecords, "_ingest_records", None))
+
+
+def test_the_client_carries_an_authenticated_httpx_transport() -> None:
+    """`annotation_api` sends its own requests down the SDK's own client.
+
+    The whole seam rests on this: the transport is a real `httpx.Client`
+    already carrying the base URL and the API-key header, so reaching an
+    endpoint the SDK never wrapped costs no second credential path. If it
+    ever stopped being an `httpx.Client`, `raise_for_status` and the
+    `httpx.HTTPStatusError` the exit codes are read from would go with it.
+
+    The transport is built through the SDK's own factory rather than by
+    constructing `Argilla`, which validates the connection in `__init__` and
+    would need a live server -- these tests deliberately need none.
+    """
+    import httpx
+    from argilla._api import create_http_client
+    from argilla._api._client import APIClient
+
+    # ...and that factory is the one the client uses for the attribute the
+    # seam reads, so asserting on its product asserts on the real thing.
+    assert "self.http_client = create_http_client(" in inspect.getsource(
+        APIClient.__init__
+    )
+
+    transport = create_http_client(
+        api_url="https://argilla.example.com",
+        api_key="a-key",
+        timeout=60,
+        retries=0,
+    )
+
+    assert isinstance(transport, httpx.Client)
+    assert str(transport.base_url).startswith("https://argilla.example.com")
+    assert transport.headers["X-Argilla-Api-Key"] == "a-key"
+
+
+def test_the_sdk_only_searches_records_through_the_admin_route() -> None:
+    """Why `annotation_api` exists at all.
+
+    `dataset.records` reaches the server through `RecordsAPI.search`, which
+    posts to `/api/v1/datasets/{id}/records/search` -- owner/admin only,
+    because it returns every user's responses. There is no `/me` equivalent
+    anywhere in the records API. The day one appears, this test fails and the
+    hand-rolled request should be replaced by it.
+
+    Read off the class rather than off `search`: every method is wrapped by
+    `api_error_handler`, which does not use `functools.wraps`, so the
+    per-method source is the wrapper's.
+    """
+    from argilla._api._records import RecordsAPI
+
+    source = inspect.getsource(RecordsAPI)
+    assert "/api/v1/datasets/{dataset_id}/records/search" in source
+    assert "me/datasets" not in source
+
+
+def test_the_sdk_response_wrapper_insists_on_a_user_id() -> None:
+    """Why the response POST is hand-rolled rather than delegated.
+
+    `RecordsAPI.create_record_response` posts to the same URL this CLI does,
+    but only through `UserResponseModel`, which warns when `user_id` is
+    absent and then serialises the absent one as the string `"None"`. On
+    `/api/v1/records/{id}/responses` the server binds the response to the
+    authenticated caller, so there is no user id for an annotator to supply
+    and nothing useful to do about the warning. The extra key survives only
+    because the server's schema ignores unknown fields.
+    """
+    import warnings
+
+    from argilla._models._record._response import UserResponseModel
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model = UserResponseModel(values={"label": {"value": "x"}}, status="submitted")
+
+    assert any("user_id" in str(w.message) for w in caught)
+    assert model.model_dump()["user_id"] == "None"
 
 
 def test_workspace_membership_takes_a_user_or_a_username() -> None:
