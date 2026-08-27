@@ -8,6 +8,13 @@ deliberately mirrors two SDK behaviours that the CLI has to get right:
 * a callable accessor returns ``None`` for a missing resource instead of
   raising -- the source of the old ``'NoneType' object has no attribute
   'delete'`` crash.
+
+The ``fake_api`` fixture adds the third: ``client.api.http_client``, the
+authenticated ``httpx.Client`` the SDK builds but never points at the
+annotator-grade endpoints (see ``argilla_cli.annotation_api``). It is a *real*
+``httpx.Client`` over a scripted transport rather than a hand-rolled stub, so
+responses go through httpx's own ``raise_for_status`` and a scripted 403
+reaches the CLI as the exception a live server would produce.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -252,6 +260,54 @@ class _Accessor:
         return matches[0] if matches else None
 
 
+class FakeAPI:
+    """Stand-in for ``client.api``: the namespace holding the HTTP transport.
+
+    ``rg.Argilla`` builds an authenticated ``httpx.Client`` and hangs it off
+    both itself and ``client.api``; the endpoints the SDK never wrapped are
+    reached through it directly. Routes are scripted per
+    ``(method, path)`` and every request is recorded, so a test can assert on
+    the URL, the query params and the body that actually went out -- there is
+    no client-side schema to catch a wrong one.
+
+    An unscripted path answers 404 rather than raising, matching a server that
+    does not know the route.
+    """
+
+    BASE_URL = "https://argilla.example.com"
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self._routes: dict[tuple[str, str], tuple[int, Any]] = {}
+        self.http_client = httpx.Client(
+            base_url=self.BASE_URL,
+            headers={"X-Argilla-Api-Key": "rbga_test_key"},
+            transport=httpx.MockTransport(self._handle),
+        )
+
+    def route(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        status_code: int = 200,
+    ) -> None:
+        """Script the response for one ``(method, path)`` pair."""
+        self._routes[(method.upper(), path)] = (status_code, json)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        scripted = self._routes.get((request.method, request.url.path))
+        if scripted is None:
+            return httpx.Response(
+                404,
+                json={"detail": f"no route for {request.method} {request.url.path}"},
+            )
+        status_code, payload = scripted
+        return httpx.Response(status_code, json=payload)
+
+
 class FakeArgilla:
     """Minimal stand-in for ``rg.Argilla``."""
 
@@ -270,6 +326,12 @@ class FakeArgilla:
         for user in self._users:
             user._client = self
         self.me = me or FakeUser("owner", role="owner")
+        # Absent by default, and attached by the ``fake_api`` fixture. Handing
+        # every fake client a transport would quietly retire the tests that
+        # pin "this client exposes none" -- `server info` reaches for
+        # ``client.api.http_client`` too, so those would start probing a
+        # scripted server instead of taking the no-transport path.
+        self.api: FakeAPI | None = None
 
     @property
     def workspaces(self) -> _Accessor:
@@ -310,6 +372,19 @@ def fake_client() -> FakeArgilla:
         datasets=datasets,
         users=[alice, bob],
     )
+
+
+@pytest.fixture
+def fake_api(fake_client: FakeArgilla) -> FakeAPI:
+    """Give the fake server a scriptable HTTP transport, and hand it back.
+
+    Opt-in, for the reason recorded on ``FakeArgilla.api``. Script the routes
+    a test needs with ``fake_api.route(...)`` and read what went out of
+    ``fake_api.requests``.
+    """
+    api = FakeAPI()
+    fake_client.api = api
+    return api
 
 
 @pytest.fixture(autouse=True)
